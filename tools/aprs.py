@@ -313,7 +313,22 @@ def cmd_capture(args):
     iq = ((out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32))
           / 32768.0).astype(np.complex64)[:got]
     print(f"[capture] {len(iq)/FS:.1f}s captured, demodulating ...")
+    # H6 control: RF burst counter - separates "band is quiet" from "our
+    # demod is deaf". 10 ms envelope cells; a burst = >=80 ms above 2.5x
+    # the noise floor (APRS packets run ~300-1000 ms).
+    k = int(0.01 * FS)
+    env = np.abs(iq[:len(iq) // k * k]).reshape(-1, k).mean(axis=1)
+    floor = float(np.median(env)) + 1e-9
+    hot = env > 2.5 * floor
+    bursts = 0
+    run = 0
+    for h in hot:
+        run = run + 1 if h else 0
+        if run == 8:
+            bursts += 1
     frames = demod(iq)
+    print(f"[control] RF bursts >=80ms: {bursts}  (bursts>>frames = demod "
+          f"deficit; ~0 = quiet band)")
     print(f"[result] CRC-valid AX.25 frames: {len(frames)}")
     seen = {}
     for f in frames:
