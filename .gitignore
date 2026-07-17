@@ -1,0 +1,4 @@
+lab/
+*.cs16
+__pycache__/
+*.pyc
