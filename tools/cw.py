@@ -155,6 +155,91 @@ def cmd_decode(args):
     return txt
 
 
+def _ensure_sdr_dll_path():
+    """Windows + conda-style python: SoapySDR driver DLLs aren't on PATH
+    unless the environment is activated - fix it here so bare launches work."""
+    import os
+    if os.name != "nt":
+        return
+    root = Path(sys.executable).resolve().parent
+    for p in (root / "Library" / "bin",
+              Path(r"C:\Program Files\SDRplay\API\x64"),
+              Path(r"C:\Program Files\SDRplay\API")):
+        if p.is_dir():
+            os.environ["PATH"] = str(p) + os.pathsep + os.environ["PATH"]
+            try:
+                os.add_dll_directory(str(p))
+            except Exception:
+                pass
+
+
+def _open_sdr(antenna, fs=250_000.0):
+    _ensure_sdr_dll_path()
+    import SoapySDR
+    from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
+    SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
+    sdr = SoapySDR.Device("driver=sdrplay")
+    sdr.setSampleRate(SOAPY_SDR_RX, 0, fs)
+    try:
+        sdr.setAntenna(SOAPY_SDR_RX, 0, antenna)
+    except Exception:
+        pass
+    try:
+        sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+        sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 30)
+        sdr.writeSetting("rfgain_sel", "0")
+    except Exception:
+        pass
+    st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+    sdr.activateStream(st)
+    return sdr, st
+
+
+def _grab(sdr, st, secs, fs=250_000.0):
+    n_want = int(secs * fs)
+    buf = np.empty(2 * 65536, np.int16)
+    out = np.empty(2 * n_want, np.int16)
+    got = 0
+    while got < n_want:
+        r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
+        if r.ret > 0:
+            n = min(r.ret, n_want - got)
+            out[2 * got:2 * (got + n)] = buf[:2 * n]
+            got += n
+        elif r.ret < 0 and r.ret != -1:
+            break
+    return ((out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32))
+            / 32768.0).astype(np.complex64)[:got]
+
+
+def cmd_listen(args):
+    """Live capture on a CW-active frequency, then decode. Real reads are
+    logged to lab/cw_decodes.jsonl."""
+    import json
+    import time as _t
+    from SoapySDR import SOAPY_SDR_RX
+    sdr, st = _open_sdr(args.antenna, args.fs)
+    sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
+    _t.sleep(0.2)
+    iq = _grab(sdr, st, args.secs, args.fs)
+    sdr.deactivateStream(st); sdr.closeStream(st)
+    off = find_offset(iq, args.fs)
+    env, a = envelope(iq, args.fs, off)
+    txt, info = decode_env(env, a)
+    wpm = info.get("wpm", 0)
+    if 3 <= wpm <= 45 and txt.strip():
+        print(f"[cw] {args.khz} kHz  {info}")
+        print(f"[cw] MORSE DECODED: '{txt}'")
+        lab = Path(__file__).resolve().parent.parent / "lab"
+        lab.mkdir(exist_ok=True)
+        rec = {"ts": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+               "khz": args.khz, "wpm": wpm, "text": txt}
+        with open(lab / "cw_decodes.jsonl", "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    else:
+        print(f"[cw] {args.khz} kHz: no readable CW (wpm {wpm})")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -164,11 +249,18 @@ def main():
     d.add_argument("--file", required=True)
     d.add_argument("--offset", type=float, default=None)
     d.add_argument("--fs", type=float, default=250000)
+    li = sub.add_parser("listen")
+    li.add_argument("--khz", type=float, default=14030)   # 20m CW calling area
+    li.add_argument("--secs", type=float, default=30)
+    li.add_argument("--antenna", default="Antenna C")
+    li.add_argument("--fs", type=float, default=250000)
     args = ap.parse_args()
     if args.cmd == "selftest":
         sys.exit(cmd_selftest(args))
-    else:
+    elif args.cmd == "decode":
         cmd_decode(args)
+    else:
+        cmd_listen(args)
 
 
 if __name__ == "__main__":
