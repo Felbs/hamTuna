@@ -39,7 +39,8 @@ except Exception:
 FS = 250_000.0
 N_FFT = 2048
 DISP_BINS = 500
-DECODE_SECS = 6          # rolling decode window (shorter = more "live")
+DECODE_SECS = 24         # COHERENT decode window. Short windows (v2 used 6 s)
+DECODE_EVERY = 4         # chop transmissions mid-word/char -> fragmented stubs.
 SPAN_KHZ = FS / 1e3
 AUD_DEC = 31             # 250000/31 = 8064.5 Hz audio
 AUD_FS = int(FS / AUD_DEC)
@@ -61,6 +62,41 @@ _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
 _lp = firwin(159, 1500.0 / (FS / 2)).astype(np.float32)   # narrow CW filter
 
+# IQ ring buffer: the reader writes here fast; the decoder snapshots a long
+# coherent window off-thread so a slow decode never stalls the SDR read
+# (a stalled read drops samples -> gapped timing -> real gibberish).
+RING = np.zeros(int(30 * FS), np.complex64)
+_rw = 0
+_rfill = 0
+_rlock = threading.Lock()
+
+
+def ring_write(iq):
+    global _rw, _rfill
+    m = len(iq); L = len(RING)
+    with _rlock:
+        if _rw + m <= L:
+            RING[_rw:_rw + m] = iq
+        else:
+            k = L - _rw; RING[_rw:] = iq[:k]; RING[:m - k] = iq[k:]
+        _rw = (_rw + m) % L
+        _rfill = min(L, _rfill + m)
+
+
+def ring_snapshot(secs):
+    n = min(int(secs * FS), _rfill)
+    if n < FS:
+        return None
+    with _rlock:
+        idx = (np.arange(_rw - n, _rw) % len(RING))
+        return RING[idx].astype(np.complex64)
+
+
+def ring_clear():
+    global _rfill
+    with _rlock:
+        _rfill = 0
+
 
 def _spectrum(iq):
     n = len(iq) // N_FFT * N_FFT
@@ -74,7 +110,9 @@ def _spectrum(iq):
 
 
 def decode_cw(iq):
-    off = cw.find_offset(iq, FS, search=50000)
+    # NARROW search: decode the signal you TUNED to (near center), not a distant
+    # strong FT8/data carrier that a wide ±50 kHz search would lock instead.
+    off = cw.find_offset(iq, FS, search=4000)
     env, aud = cw.envelope(iq, FS, off)
     txt, info = cw.decode_env(env, aud)
     chars = [c for c in txt if c != " "]
@@ -135,9 +173,7 @@ class SDRWorker(threading.Thread):
         except Exception:
             pass
         cur = None
-        acc = deque(maxlen=int(DECODE_SECS * FS))
         buf = np.empty(2 * 65536, np.int16)
-        last_decode = 0.0
         last_off = 0.0
         while STATE["running"]:
             if radio_lock and radio_lock.should_yield():
@@ -145,44 +181,28 @@ class SDRWorker(threading.Thread):
             if STATE["center_khz"] != cur:
                 cur = STATE["center_khz"]
                 sdr.setFrequency(SOAPY_SDR_RX, 0, cur * 1e3)
-                acc.clear(); self.zi = None; time.sleep(0.15)
+                ring_clear(); self.zi = None; time.sleep(0.15)
             r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
             if r.ret <= 0:
                 continue
             iq = ((buf[0:2 * r.ret:2].astype(np.float32)
                    + 1j * buf[1:2 * r.ret:2].astype(np.float32)) / 32768.0).astype(np.complex64)
-            acc.extend(iq)
+            ring_write(iq)                          # fast; decode happens off-thread
             db = _spectrum(iq)
             if db is not None:
                 with _lock:
                     SPEC["db"] = db.tolist(); SPEC["peak_db"] = float(db.max())
                     SPEC["noise_db"] = float(np.percentile(db, 25)); SPEC["ts"] = time.time()
-            # track CW carrier ~1.5 Hz for the audio BFO
-            if STATE["mode"] == "CW" and time.time() - last_off > 1.5 and len(acc) > FS:
-                last_off = time.time()
-                try:
-                    self.cw_off = cw.find_offset(np.fromiter(list(acc)[-int(FS):], np.complex64, int(FS)), FS, 50000)
-                except Exception:
-                    pass
             if STATE["mode"] == "CW":
+                if time.time() - last_off > 1.5:    # track carrier for the audio BFO
+                    last_off = time.time()
+                    snap = ring_snapshot(1.0)
+                    if snap is not None:
+                        try: self.cw_off = cw.find_offset(snap, FS, 4000)
+                        except Exception: pass
                 self._audio(iq)
-            if (STATE["mode"] in DECODERS and len(acc) >= DECODE_SECS * FS * 0.9
-                    and time.time() - last_decode > DECODE_SECS):
-                last_decode = time.time()
-                iqd = np.fromiter(acc, np.complex64, len(acc))
-                try:
-                    res = DECODERS[STATE["mode"]](iqd)
-                except Exception as e:
-                    res = {"text": "", "wpm": 0, "q": 0, "conf": 0, "elements": 0,
-                           "hint": f"decode err: {e}"[:80], "offset_hz": 0}
-                res["mode"] = STATE["mode"]; res["ts"] = time.time()
-                with _lock:
-                    DECODE.update(res)
-                    if res["text"]:
-                        TRANSCRIPT.append({"ts": time.strftime("%H:%M:%S"),
-                                           "text": res["text"], "q": res["q"]})
-                if radio_lock:
-                    radio_lock.heartbeat()
+            if radio_lock:
+                radio_lock.heartbeat()
         try:
             sdr.deactivateStream(st); sdr.closeStream(st); del sdr
         except Exception:
@@ -190,6 +210,33 @@ class SDRWorker(threading.Thread):
         if radio_lock:
             radio_lock.release("hamtuna_panel")
         STATE["lock"] = "released"
+
+
+class Decoder(threading.Thread):
+    """Off the read thread: every DECODE_EVERY s, snapshot a long COHERENT
+    window from the ring and decode it as one piece (like the old cw.py listen),
+    so transmissions aren't chopped into fragments and the reader never stalls."""
+    daemon = True
+
+    def run(self):
+        while True:
+            time.sleep(DECODE_EVERY)
+            if not STATE["running"] or STATE["mode"] not in DECODERS:
+                continue
+            iqd = ring_snapshot(DECODE_SECS)
+            if iqd is None:
+                continue
+            try:
+                res = DECODERS[STATE["mode"]](iqd)
+            except Exception as e:
+                res = {"text": "", "wpm": 0, "q": 0, "conf": 0, "elements": 0,
+                       "hint": f"decode err: {e}"[:80], "offset_hz": 0}
+            res["mode"] = STATE["mode"]; res["ts"] = time.time()
+            with _lock:
+                DECODE.update(res)
+                if res["text"]:
+                    TRANSCRIPT.append({"ts": time.strftime("%H:%M:%S"),
+                                       "text": res["text"], "q": res["q"]})
 
 
 def _wav_header(nbytes=0x7FFFF000):
@@ -275,6 +322,7 @@ def main():
     args = ap.parse_args()
     os.environ["PATH"] = r"C:\Program Files\SDRplay\API\x64" + os.pathsep + os.environ.get("PATH", "")
     SDRWorker().start()
+    Decoder().start()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 
 
@@ -298,8 +346,8 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .gauge{height:10px;background:#08120f;border-radius:6px;overflow:hidden;margin:6px 0}
 .gfill{height:100%;background:linear-gradient(90deg,var(--acc2),var(--warn),var(--good));transition:width .3s}
 .big{font-size:22px;font-weight:700}
-.xscript{background:#000;border:1px solid var(--hair);border-radius:8px;padding:10px;height:150px;overflow-y:auto;font-size:13px;line-height:1.6;display:flex;flex-direction:column-reverse}
-.xline{color:var(--acc)}.xline .t{color:var(--mut);font-size:10px;margin-right:6px}
+.xscript{background:#000;border:1px solid var(--hair);border-radius:8px;padding:10px;height:150px;overflow-y:auto;font-size:15px;line-height:1.7;letter-spacing:.04em}
+.xline{color:var(--acc);word-break:break-word}
 .stat{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);padding:2px 0}.stat b{color:var(--ink)}
 .autob{background:var(--acc);color:#04110e;font-weight:700;width:100%;padding:10px;font-size:13px}
 .listen{width:100%;padding:9px;font-size:13px;font-weight:700}.listen.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
@@ -357,9 +405,10 @@ async function refresh(){
   $('sm').textContent=(ST.smeter||0).toFixed(0)+' dB';$('smbar').style.width=Math.min(100,(ST.smeter||0)*2.2)+'%';
   $('declbl').textContent=ST.mode==='CW'?'Live Morse transcript':ST.mode+' decode';
   const xs=$('xscript');
-  if(ST.mode==='CW'){const t=(ST.transcript||[]).slice().reverse();
-    xs.innerHTML=t.length?t.map(l=>`<div class=xline><span class=t>${l.ts}</span>${l.text}</div>`).join(''):'<div class=sub>…listening for CW…</div>';}
-  else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
+  if(ST.mode==='CW'){
+    xs.innerHTML = d.text ? `<div class=xline>${d.text}</div>` : '<div class=sub>…listening for CW…</div>';
+    xs.scrollTop=xs.scrollHeight;
+  } else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
   $('hint').textContent=d.hint||'';
 }
 async function set(kv){await api('/set?'+kv);refresh();}
