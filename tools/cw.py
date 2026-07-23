@@ -44,6 +44,35 @@ def envelope(iq, fs, off_hz, aud=8000):
     return np.convolve(env, np.ones(k, np.float32) / k, mode="same"), aud
 
 
+def _gap_boundaries(off_runs, dit):
+    """Adaptive intra/letter and letter/word gap boundaries via 3-means on the
+    internal gaps. Fixed 2*dit / 5*dit thresholds break under FARNSWORTH spacing
+    (fast characters, stretched gaps): the letter-gap cluster stretches past
+    5*dit and gets misread as word gaps, splitting callsigns ('KI 4XH'). Fitting
+    the actual gap clusters puts the word boundary in the real valley between
+    them. Falls back to the classic multiples when the gaps are too few/degenerate.
+    """
+    g = np.array([x for x in off_runs if x < 25 * dit], float)   # drop inter-tx silence
+    if len(g) < 6:
+        return 2 * dit, 5 * dit
+    c = np.array([1.0, 3.5, 7.0]) * dit                          # init at 1:3:7 units
+    for _ in range(30):
+        lab = np.abs(g[:, None] - c[None, :]).argmin(1)
+        newc = np.array([g[lab == k].mean() if np.any(lab == k) else c[k]
+                         for k in range(3)])
+        newc.sort()
+        if np.allclose(newc, c):
+            break
+        c = newc
+    if c[2] < 1.6 * c[1]:                        # letter & word clusters not separated
+        lb = np.sqrt(c[0] * c[1]) if c[1] > 1.3 * c[0] else 2 * dit
+        return lb, 1e18                          # -> no word gaps in this stream
+    lb, wb = np.sqrt(c[0] * c[1]), np.sqrt(c[1] * c[2])  # geometric-mean valleys
+    if not (dit < lb < wb):
+        return 2 * dit, 5 * dit
+    return lb, wb
+
+
 def decode_env(env, aud):
     """Adaptive on/off -> run lengths -> self-calibrated Morse."""
     hi, lo = np.percentile(env, 90), np.percentile(env, 25)
@@ -69,17 +98,21 @@ def decode_env(env, aud):
     o = np.array(on_runs, float)
     med = np.median(o)
     dit = np.median(o[o <= med]) or med
+    # gap boundaries adapt to the stream's own spacing (Farnsworth-safe)
+    off_runs = [ln for i, (s, ln) in enumerate(runs) if not s and 0 < i < len(runs) - 1]
+    lb, wb = _gap_boundaries(off_runs, dit)
     text = []
     sym = ""
     for s, ln in runs:
         if s:                              # tone
             sym += "-" if ln > 2 * dit else "."
         else:                              # gap
-            if ln > 5 * dit:
-                text.append(MORSE.get(sym, "?") if sym else "")
+            if ln > wb:                    # word gap
+                if sym:
+                    text.append(MORSE.get(sym, "?"))
                 text.append(" ")
                 sym = ""
-            elif ln > 2 * dit:
+            elif ln > lb:                  # letter gap
                 if sym:
                     text.append(MORSE.get(sym, "?"))
                     sym = ""
