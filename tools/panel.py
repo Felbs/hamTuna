@@ -157,9 +157,14 @@ def decode_cw(iq):
     wpm = info.get("wpm", 0.0)
     ok = 3 <= wpm <= 45 and txt.strip()
     conf = round(q * min(1.0, len(chars) / 10), 3) if ok else 0.0
+    if not ok:
+        hint = "no readable CW — click a signal on the waterfall or Auto-Tune"
+    elif q < 0.7:
+        hint = f"weak/noisy signal — only {int(q * 100)}% clean; pick a stronger one from the list"
+    else:
+        hint = ""
     return {"text": txt if ok else "", "wpm": wpm, "q": q, "conf": conf,
-            "elements": info.get("elements", 0), "offset_hz": round(off, 1),
-            "hint": "" if ok else "no readable CW — click a signal on the waterfall or Auto-Tune"}
+            "elements": info.get("elements", 0), "offset_hz": round(off, 1), "hint": hint}
 
 
 DECODERS = {"CW": decode_cw}
