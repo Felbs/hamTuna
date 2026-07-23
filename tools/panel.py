@@ -16,6 +16,7 @@ listen to while you read. Single SDR via radio_lock@80, Antenna C (HF).
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 import threading
@@ -48,7 +49,43 @@ BFO_HZ = 600.0          # CW carrier is mixed to this pitch
 
 BANDS = {"160m": 1830, "80m": 3560, "40m": 7030, "30m": 10120, "20m": 14030,
          "17m": 18080, "15m": 21030, "12m": 24906, "10m": 28030}
+# CW lives at the bottom of each band (ham band plan). Signal-hunt + auto-tune
+# stay inside these so they lock CW, not the FT8/SSB above.
+CW_SUB = {"160m": (1800, 1843), "80m": (3500, 3600), "40m": (7000, 7040),
+          "30m": (10100, 10130), "20m": (14000, 14070), "17m": (18068, 18095),
+          "15m": (21000, 21070), "12m": (24890, 24915), "10m": (28000, 28070)}
 MODES = ["CW", "SSB", "AM", "FM", "APRS", "FT8"]
+
+
+def detect_signals():
+    """Carriers (peaks over noise) inside the current band's CW sub-band and the
+    visible window — the CW 'channels' on the air right now. This is navigation."""
+    with _lock:
+        db = np.array(SPEC["db"]); c = STATE["center_khz"]
+        noise = SPEC["noise_db"]; band = STATE["band"]
+    if not len(db):
+        return []
+    sub = CW_SUB.get(band)
+    lo_khz = c - SPAN_KHZ / 2
+    binkhz = SPAN_KHZ / len(db)
+    thr = noise + 7.0
+    peaks = []
+    for i in range(2, len(db) - 2):
+        f = lo_khz + i * binkhz
+        if sub and not (sub[0] <= f <= sub[1]):
+            continue
+        v = db[i]
+        if v > thr and v >= db[i - 1] and v > db[i + 1] and v >= db[i - 2] and v > db[i + 2]:
+            peaks.append((round(f, 2), round(v - noise, 1)))
+    peaks.sort()
+    merged = []
+    for f, s in peaks:                 # merge carriers within 0.4 kHz
+        if merged and f - merged[-1][0] < 0.4:
+            if s > merged[-1][1]:
+                merged[-1] = (f, s)
+        else:
+            merged.append((f, s))
+    return [{"khz": f, "snr": s} for f, s in merged]
 
 STATE = {"center_khz": 14030.0, "band": "20m", "mode": "CW", "ifgr": 30,
          "rfsel": 0, "running": True, "antenna": "Antenna C", "lock": "none", "err": ""}
@@ -126,6 +163,74 @@ def decode_cw(iq):
 
 
 DECODERS = {"CW": decode_cw}
+
+# ── logbook: harvest callsigns like a real ham, and score them ──
+LOGFILE = HERE.parent / "lab" / "cw_log.jsonl"
+LOGBOOK = {}                       # call -> record
+CALL_RE = re.compile(r"^[A-Z0-9]{1,2}[0-9][A-Z]{1,4}$")
+PROSIGN = {"CQ", "DE", "QRL", "QSL", "QSO", "QTH", "QRZ", "QRM", "QRN", "QSB",
+           "QRP", "TU", "GM", "GA", "GE", "RST", "AGN", "BK", "AR", "SK", "KN",
+           "73", "88", "FB", "OM", "UR", "PSE", "POTA", "SOTA", "WX", "TNX"}
+
+
+def extract_calls(text):
+    """Callsign-pattern tokens that are confident: repeated (hams send calls
+    2-3x) or right after DE/CQ. Confidence-gating keeps decode noise out."""
+    toks = text.upper().split()
+    out = {}
+    for i, t in enumerate(toks):
+        if t in PROSIGN or not CALL_RE.match(t):
+            continue
+        conf = 0
+        if toks.count(t) >= 2:
+            conf += 2
+        if i > 0 and toks[i - 1] in ("DE", "CQ"):
+            conf += 2
+        if 3 <= len(t) <= 6:
+            conf += 1
+        if conf >= 2:
+            out[t] = max(out.get(t, 0), conf)
+    return out
+
+
+def _load_log():
+    try:
+        for line in open(LOGFILE, encoding="utf-8"):
+            r = json.loads(line)
+            LOGBOOK[r["call"]] = r
+    except Exception:
+        pass
+
+
+def log_calls(calls, band, khz, snr):
+    new = []
+    for c in calls:
+        if c in LOGBOOK:
+            LOGBOOK[c]["count"] += 1
+            if band not in LOGBOOK[c]["bands"]:
+                LOGBOOK[c]["bands"].append(band); LOGBOOK[c]["points"] += 3  # new band = +3
+        else:
+            prefix = re.match(r"[A-Z0-9]*[0-9]", c).group()
+            rare = 5 if not any(v["call"].startswith(prefix[:2]) for v in LOGBOOK.values()) else 0
+            rec = {"call": c, "first": time.strftime("%Y-%m-%d %H:%M"),
+                   "bands": [band], "khz": khz, "count": 1, "snr": snr,
+                   "points": 10 + rare}          # 10 base, +5 new prefix
+            LOGBOOK[c] = rec; new.append(rec)
+    if new:
+        try:
+            LOGFILE.parent.mkdir(exist_ok=True)
+            with open(LOGFILE, "a", encoding="utf-8") as f:
+                for r in new:
+                    f.write(json.dumps(r) + "\n")
+        except Exception:
+            pass
+    return new
+
+
+def log_summary():
+    calls = list(LOGBOOK.values())
+    return {"score": sum(c["points"] for c in calls), "count": len(calls),
+            "calls": sorted(calls, key=lambda c: c["first"], reverse=True)[:30]}
 
 
 class SDRWorker(threading.Thread):
@@ -237,6 +342,14 @@ class Decoder(threading.Thread):
                 if res["text"]:
                     TRANSCRIPT.append({"ts": time.strftime("%H:%M:%S"),
                                        "text": res["text"], "q": res["q"]})
+                    snr = round(max(0, SPEC["peak_db"] - SPEC["noise_db"]), 1)
+            if res.get("text") and res["mode"] == "CW":
+                got = log_calls(extract_calls(res["text"]), STATE["band"],
+                                STATE["center_khz"], snr)
+                if got:
+                    res["new_calls"] = [g["call"] for g in got]
+                    with _lock:
+                        DECODE["new_calls"] = res["new_calls"]
 
 
 def _wav_header(nbytes=0x7FFFF000):
@@ -285,11 +398,23 @@ class H(BaseHTTPRequestHandler):
                 STATE["running"] = q["running"][0] == "1"
             self._send(json.dumps({"ok": True}))
         elif u.path == "/autotune":
-            with _lock:
-                db = np.array(SPEC["db"])
-            if len(db):
-                off = (int(np.argmax(db)) - len(db) / 2) * (FS / len(db))
-                STATE["center_khz"] = round(STATE["center_khz"] + off / 1e3, 2)
+            sigs = detect_signals()          # strongest CW carrier in-band (not FT8)
+            if sigs:
+                STATE["center_khz"] = max(sigs, key=lambda s: s["snr"])["khz"]
+            self._send(json.dumps({"ok": True, "center": STATE["center_khz"]}))
+        elif u.path == "/signals":
+            self._send(json.dumps({"signals": detect_signals(), "center": STATE["center_khz"]}))
+        elif u.path == "/log":
+            self._send(json.dumps(log_summary()))
+        elif u.path == "/step":
+            d = q.get("d", ["1"])[0]
+            freqs = sorted(s["khz"] for s in detect_signals())
+            if freqs:
+                c = STATE["center_khz"]
+                if d == "1":
+                    STATE["center_khz"] = next((f for f in freqs if f > c + 0.25), freqs[0])
+                else:
+                    STATE["center_khz"] = next((f for f in reversed(freqs) if f < c - 0.25), freqs[-1])
             self._send(json.dumps({"ok": True, "center": STATE["center_khz"]}))
         elif u.path == "/cw_audio.wav":
             self._stream_audio()
@@ -321,6 +446,7 @@ def main():
     ap.add_argument("--port", type=int, default=8647)
     args = ap.parse_args()
     os.environ["PATH"] = r"C:\Program Files\SDRplay\API\x64" + os.pathsep + os.environ.get("PATH", "")
+    _load_log()
     SDRWorker().start()
     Decoder().start()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
@@ -351,6 +477,18 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .stat{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);padding:2px 0}.stat b{color:var(--ink)}
 .autob{background:var(--acc);color:#04110e;font-weight:700;width:100%;padding:10px;font-size:13px}
 .listen{width:100%;padding:9px;font-size:13px;font-weight:700}.listen.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
+.siglist{background:#000;border:1px solid var(--hair);border-radius:8px;max-height:150px;overflow-y:auto}
+.sig{display:flex;align-items:center;gap:8px;padding:5px 9px;font-size:12px;cursor:pointer;border-bottom:1px solid #0b141c}
+.sig:last-child{border-bottom:none}.sig:hover{background:#0b141c}.sig.on{background:rgba(46,230,200,.12);color:var(--acc)}
+.sig .bar{flex:1;height:5px;background:#08120f;border-radius:3px;overflow:hidden}.sig .bar span{display:block;height:100%;background:var(--acc)}
+.sig .snr{color:var(--mut);font-size:10px;width:40px;text-align:right}
+button.step{padding:2px 9px;font-size:13px;font-weight:700}
+.logbook{background:#060d13;border:1px solid var(--hair);border-radius:10px;padding:12px}
+.score{font-size:28px;font-weight:700;color:var(--good);text-shadow:0 0 12px rgba(58,209,122,.3)}.score small{font-size:12px;color:var(--mut);margin-left:5px}
+.loglist{max-height:150px;overflow-y:auto;margin-top:6px}
+.logrow{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:4px 0;border-bottom:1px solid #0b141c}
+.logrow:last-child{border-bottom:none}.logrow .call{color:var(--acc);font-weight:700}.logrow .meta{color:var(--mut);font-size:10px}
+.newcall{color:var(--good);font-weight:700;font-size:13px;min-height:16px}
 .smeter{height:8px;background:#08120f;border-radius:5px;overflow:hidden}.sfill{height:100%;background:var(--acc);transition:width .2s}
 .chip{font-size:10px;padding:2px 7px;border-radius:20px;border:1px solid var(--hair);color:var(--mut)}
 .chip.held{color:var(--good);border-color:var(--good)}.chip.busy{color:var(--warn);border-color:var(--warn)}
@@ -367,7 +505,14 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
   <div class=side>
     <div><div class=lbl>Band</div><div class=row id=bands></div></div>
     <div><div class=lbl>Mode</div><div class=row id=modes></div></div>
-    <button class=autob onclick=autotune()>&#9673; AUTO-TUNE to strongest</button>
+    <button class=autob onclick=autotune()>&#9673; AUTO-TUNE (strongest CW)</button>
+    <div>
+      <div class=lbl style="display:flex;justify-content:space-between;align-items:center">
+        <span>CW signals on air</span>
+        <span><button class=step onclick="step(-1)">&#9664;</button> <button class=step onclick="step(1)">&#9654;</button></span>
+      </div>
+      <div class=siglist id=siglist></div>
+    </div>
     <button class=listen id=listenb onclick=togListen()>&#9654; LISTEN (live audio)</button>
     <audio id=au></audio>
     <div class=dial>
@@ -379,6 +524,13 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
       <div class=smeter><div class=sfill id=smbar style=width:0%></div></div>
     </div>
     <div><div class=lbl id=declbl>Live Morse transcript</div><div class=xscript id=xscript></div></div>
+    <div class=newcall id=newcall></div>
+    <div class=logbook>
+      <div class=lbl style="display:flex;justify-content:space-between;align-items:baseline">
+        <span>&#128225; Logbook</span><span id=logcount class=sub></span></div>
+      <div class=score><span id=score>0</span><small>pts</small></div>
+      <div class=loglist id=loglist></div>
+    </div>
     <div class=sub id=hint></div>
   </div>
 </div>
@@ -410,9 +562,20 @@ async function refresh(){
     xs.scrollTop=xs.scrollHeight;
   } else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
   $('hint').textContent=d.hint||'';
+  $('newcall').textContent=(d.new_calls&&d.new_calls.length)?('🎉 logged '+d.new_calls.join(' ')):'';
 }
+async function pollLog(){let s;try{s=await api('/log');}catch(e){return;}
+  $('score').textContent=s.score;$('logcount').textContent=s.count+' calls';
+  $('loglist').innerHTML=(s.calls||[]).length?(s.calls).map(c=>
+    `<div class=logrow><span class=call>${c.call}</span><span class=meta>${c.bands.join('/')} &middot; &times;${c.count} &middot; ${c.points}pt</span></div>`).join('')
+    :'<div class=sub>no calls yet — tune in a CQ and collect \'em</div>';}
 async function set(kv){await api('/set?'+kv);refresh();}
 async function autotune(){await api('/autotune');refresh();}
+async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
+async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
+  const list=$('siglist'),sigs=s.signals||[],c=s.center;
+  list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-c)<0.3;
+    return `<div class="sig${on?' on':''}" onclick="set('center=${x.khz}')"><span>${x.khz.toFixed(2)}</span><span class=bar><span style="width:${Math.min(100,x.snr*3)}%"></span></span><span class=snr>${x.snr}dB</span></div>`;}).join(''):'<div class=sub style="padding:8px">no CW carriers here — try another band</div>';}
 // click a canvas -> snap to the local peak near the click (point-and-click nav)
 function snap(e,c){const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
   if(!DB.length||!ST.center_khz)return;
@@ -447,6 +610,8 @@ async function draw(){
   setTimeout(draw,140);
 }
 refresh();setInterval(refresh,1500);draw();
+setInterval(pollSignals,2500);pollSignals();
+setInterval(pollLog,3000);
 </script></body></html>"""
 
 if __name__ == "__main__":
