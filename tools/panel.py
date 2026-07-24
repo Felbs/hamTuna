@@ -32,6 +32,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
 import cw
+import cw_lm
 import cw_quality
 import hamdb
 try:
@@ -186,6 +187,7 @@ def decode_cw(iq):
         STATE["last_off"] = off
     env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
     txt, info = cw.decode_env_auto(env, aud)          # apparatus-routed decoder
+    txt = cw_lm.rescore(txt)                          # ham LM: re-segment words + repair '?'
     chars = [c for c in txt if c != " "]
     q = round(sum(1 for c in chars if c != "?") / len(chars), 3) if chars else 0.0
     wpm = info.get("wpm", 0.0)

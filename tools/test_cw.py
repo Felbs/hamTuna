@@ -107,6 +107,21 @@ def main():
         print(f"\n[bayes] ERROR: {e}")
         fails += 1
 
+    # 4) LM rescoring guard: fixes merges/'?' without corrupting clean text
+    try:
+        import cw_lm
+        cases = [("CQ CQ DE W1AW", "CQ CQ DE W1AW"),      # clean text unchanged
+                 ("CQCQCQDE", "CQ CQ CQ DE"),             # word re-segmentation
+                 ("N?THING", "NOTHING")]                  # '?' repair -> real word
+        lmok = all(cw_lm.rescore(a) == b for a, b in cases)
+        for a, b in cases:
+            r = cw_lm.rescore(a)
+            print(f"[lm] {a!r:16} -> {r!r:16} {'ok' if r == b else 'FAIL(exp '+b+')'}")
+        fails += 0 if lmok else 1
+    except Exception as e:
+        print(f"\n[lm] ERROR: {e}")
+        fails += 1
+
     print("\n" + "=" * 62)
     print(f"RESULT: {'ALL PASS' if fails == 0 else f'{fails} REGRESSION(S)'}")
     print("=" * 62)
