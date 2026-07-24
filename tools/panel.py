@@ -108,6 +108,7 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
 TRANSCRIPT = deque(maxlen=60)
 AUDIO = deque(maxlen=AUD_FS * 4)
 SIGLIST = {"band": None, "sigs": []}   # classifier's authoritative carrier list: [{khz,snr,cw,wpm}]
+SCANNING = False                       # True while an all-bands scan is hopping (prevents overlap)
 _lock = threading.Lock()
 _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
@@ -481,6 +482,7 @@ class SDRWorker(threading.Thread):
         cur = None
         buf = np.empty(2 * 65536, np.int16)
         last_off = 0.0
+        fails = 0
         while STATE["running"]:
             if radio_lock and radio_lock.should_yield():
                 break
@@ -490,7 +492,12 @@ class SDRWorker(threading.Thread):
                 ring_clear(); self.zi = None; time.sleep(0.15)
             r = sdr.readStream(st, [buf], 16384, timeoutUs=500000)  # small reads = fast waterfall (~15 rows/s)
             if r.ret <= 0:
+                fails += 1
+                if fails > 16:            # ~8s of no data = SDR stalled (e.g. band-hop wedge)
+                    STATE["err"] = "SDR stalled — reopening"      # break -> run() retries _session (reopen stream)
+                    break
                 continue
+            fails = 0
             iq = ((buf[0:2 * r.ret:2].astype(np.float32)
                    + 1j * buf[1:2 * r.ret:2].astype(np.float32)) / 32768.0).astype(np.complex64)
             ring_write(iq)                          # fast; decode happens off-thread
@@ -696,12 +703,16 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/scanbands":
             # LIVE all-bands scan: hop each CW band, count copyable CW (open eye),
             # then tune to the best. Bounded + exception-safe (won't hang the server).
+            global SCANNING
+            if SCANNING:
+                self._send(json.dumps({"busy": True})); return
+            SCANNING = True
             orig = (STATE["band"], STATE["center_khz"])
             results = []
             try:
                 for band, ctr in BANDS.items():
                     STATE["band"] = band; STATE["center_khz"] = float(ctr)  # reader retunes
-                    time.sleep(1.6)                                          # settle + fill SPEC
+                    time.sleep(2.2)                                          # settle (gentle hop rate; fast hops wedge the RSPdx)
                     iq = ring_snapshot(2)
                     cwc, best_eye = 0, 0.0
                     if iq is not None:
@@ -717,6 +728,8 @@ class H(BaseHTTPRequestHandler):
                     results.append({"band": band, "cw": cwc, "eye": round(float(best_eye), 1)})
             except Exception as e:
                 STATE["err"] = f"scan: {e}"[:80]
+            finally:
+                SCANNING = False
             best = max(results, key=lambda r: (r["cw"], r["eye"])) if results else None
             if best and (best["cw"] > 0 or best["eye"] >= cw_quality.Q_READABLE):
                 STATE["band"] = best["band"]; STATE["center_khz"] = float(BANDS[best["band"]])
