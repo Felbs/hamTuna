@@ -42,6 +42,7 @@ except Exception:
 
 FS = 250_000.0
 N_FFT = 2048
+N_HI = 8192            # high-res spectrum bins (~30 Hz/bin over 250 kHz) for zoom
 DISP_BINS = 500
 DECODE_SECS = 24         # COHERENT decode window. Short windows (v2 used 6 s)
 DECODE_EVERY = 4         # chop transmissions mid-word/char -> fragmented stubs.
@@ -99,7 +100,8 @@ STATE = {"center_khz": 14030.0, "tune_khz": 14030.0, "band": "20m", "mode": "CW"
 
 def cur_off_hz():
     return (STATE["tune_khz"] - STATE["center_khz"]) * 1000.0
-SPEC = {"db": [0.0] * DISP_BINS, "peak_db": -120.0, "noise_db": -120.0, "ts": 0.0}
+SPEC = {"db": [0.0] * DISP_BINS, "peak_db": -120.0, "noise_db": -120.0, "ts": 0.0,
+        "hi": None}          # hi = high-res np array for zoom (kept in memory, not JSON)
 DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
           "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
@@ -109,6 +111,7 @@ SIGLIST = {"band": None, "sigs": []}   # classifier's authoritative carrier list
 _lock = threading.Lock()
 _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
+_win_hi = np.hanning(N_HI).astype(np.float32)
 _lp = firwin(159, 1500.0 / (FS / 2)).astype(np.float32)   # audio CW filter
 _narrow8k = firwin(129, 400.0 / 4000.0).astype(np.float32)  # ±400 Hz single-station filter @8 kHz
 
@@ -164,14 +167,31 @@ def ring_clear():
 
 
 def _spectrum(iq):
-    n = len(iq) // N_FFT * N_FFT
-    if n < N_FFT:
+    """High-res full-band spectrum (N_HI bins ~30 Hz/bin) so the UI can ZOOM into
+    it with real resolution. Same total FFT work as the old 2048/32-seg overview."""
+    n = len(iq) // N_HI * N_HI
+    if n < N_HI:
         return None
-    seg = iq[:n].reshape(-1, N_FFT) * _win
+    seg = iq[:n].reshape(-1, N_HI) * _win_hi
     p = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(0)
-    db = 10 * np.log10(p + 1e-9)
-    step = len(db) // DISP_BINS
-    return db[:step * DISP_BINS].reshape(DISP_BINS, step).max(1).astype(np.float32)
+    return (10 * np.log10(p + 1e-9)).astype(np.float32)          # length N_HI
+
+
+def _downsample(db, bins):
+    """Max-pool a db array to `bins` (keeps peaks visible when zoomed out)."""
+    if len(db) <= bins:
+        return db
+    step = len(db) // bins
+    return db[:step * bins].reshape(bins, step).max(1)
+
+
+def _view_slice(hi, center, vc, vs, bins=DISP_BINS):
+    """Slice the high-res spectrum to the view window [vc±vs/2] and pool to `bins`."""
+    lo_khz = center - SPAN_KHZ / 2
+    i0 = int((vc - vs / 2 - lo_khz) / SPAN_KHZ * len(hi))
+    i1 = int((vc + vs / 2 - lo_khz) / SPAN_KHZ * len(hi))
+    i0 = max(0, min(len(hi) - 2, i0)); i1 = max(i0 + 1, min(len(hi), i1))
+    return _downsample(hi[i0:i1], bins)
 
 
 _AI = "unset"          # lazy-loaded neural decoder: (model, torch) | None
@@ -414,11 +434,13 @@ class SDRWorker(threading.Thread):
             iq = ((buf[0:2 * r.ret:2].astype(np.float32)
                    + 1j * buf[1:2 * r.ret:2].astype(np.float32)) / 32768.0).astype(np.complex64)
             ring_write(iq)                          # fast; decode happens off-thread
-            db = _spectrum(iq)
-            if db is not None:
+            hi = _spectrum(iq)
+            if hi is not None:
+                ov = _downsample(hi, DISP_BINS)         # zoomed-out overview
                 with _lock:
-                    SPEC["db"] = db.tolist(); SPEC["peak_db"] = float(db.max())
-                    SPEC["noise_db"] = float(np.percentile(db, 25)); SPEC["ts"] = time.time()
+                    SPEC["hi"] = hi; SPEC["db"] = ov.tolist()
+                    SPEC["peak_db"] = float(hi.max())
+                    SPEC["noise_db"] = float(np.percentile(hi, 25)); SPEC["ts"] = time.time()
             if STATE["mode"] == "CW":
                 self._audio(iq)            # BFO follows the cursor (cur_off_hz)
             if radio_lock:
@@ -549,9 +571,24 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/":
             self._send(PAGE, "text/html; charset=utf-8")
         elif u.path == "/spectrum":
+            # optional zoom view: vc=view center kHz, vs=view span kHz. Slices the
+            # high-res spectrum for real resolution when zoomed in.
             with _lock:
-                self._send(json.dumps({"db": SPEC["db"], "peak": SPEC["peak_db"],
-                    "noise": SPEC["noise_db"], "center": STATE["center_khz"], "span": SPAN_KHZ}))
+                center = STATE["center_khz"]; hi = SPEC["hi"]
+                peak, noise = SPEC["peak_db"], SPEC["noise_db"]
+                try:
+                    vs = float(q["vs"][0]); vc = float(q["vc"][0])
+                except (KeyError, ValueError):
+                    vs = vc = None
+                if vs is not None and hi is not None and vs < SPAN_KHZ - 1:
+                    sl = _view_slice(hi, center, vc, vs)
+                    db = sl.tolist()
+                    peak = float(sl.max()); noise = float(np.percentile(sl, 25))
+                    out = {"db": db, "peak": peak, "noise": noise, "center": vc, "span": vs}
+                else:
+                    out = {"db": SPEC["db"], "peak": peak, "noise": noise,
+                           "center": center, "span": SPAN_KHZ}
+            self._send(json.dumps(out))
         elif u.path == "/state":
             with _lock:
                 self._send(json.dumps({**{k: STATE[k] for k in
@@ -760,8 +797,36 @@ function fit(){for(const c of [spec,wf]){c.width=c.clientWidth;c.height=c.client
 addEventListener('resize',fit);fit();
 async function api(p){return (await fetch(p)).json();}
 let DB=[];
+// waterfall navigation: VIEW = the visible freq window (c=center kHz, s=span kHz).
+// null span = full band. VC/VS = the actual window the last /spectrum returned.
+let VIEW={c:null,s:null}, VC=null, VS=null, FULLSPAN=250, SDRCENTER=null;
+function viewInit(center,span){FULLSPAN=span;SDRCENTER=center;
+  if(VIEW.c===null){VIEW.c=center;VIEW.s=span;}}
+function viewReset(){if(SDRCENTER!==null){VIEW.c=SDRCENTER;VIEW.s=FULLSPAN;}}
+function clampView(){const half=VIEW.s/2, lo=SDRCENTER-FULLSPAN/2+half, hi=SDRCENTER+FULLSPAN/2-half;
+  VIEW.s=Math.max(2,Math.min(FULLSPAN,VIEW.s));   // 2 kHz min zoom
+  if(VIEW.s>=FULLSPAN){VIEW.c=SDRCENTER;}else{VIEW.c=Math.max(lo,Math.min(hi,VIEW.c));}}
+function xToKhz(e,c){const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
+  return (VC!==null?VC-VS/2+fx*VS:SDRCENTER);}
+function onWheel(e){e.preventDefault();if(SDRCENTER===null)return;
+  const fk=xToKhz(e,e.currentTarget);                       // freq under the cursor
+  const factor=e.deltaY>0?1.25:0.8;                          // scroll up = zoom in
+  const before=VIEW.s;VIEW.s*=factor;clampView();
+  // keep the freq under the cursor fixed while zooming
+  const r=e.currentTarget.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
+  VIEW.c=fk-(fx-0.5)*VIEW.s;clampView();}
+let panning=false,panX=0,panC=0;
+function onPanStart(e){if(e.button!==1)return;e.preventDefault();panning=true;
+  panX=e.clientX;panC=VIEW.c;}
+function onPanMove(e){if(!panning)return;const r=e.currentTarget.getBoundingClientRect();
+  const dkhz=(e.clientX-panX)/r.width*VIEW.s;VIEW.c=panC-dkhz;clampView();}
+function onPanEnd(){panning=false;}
+let lastCenter=null;
 async function refresh(){
   ST=await api('/state');
+  if(lastCenter!==null&&Math.abs(ST.center_khz-lastCenter)>0.01){   // band changed -> reset zoom
+    SDRCENTER=ST.center_khz;FULLSPAN=ST.span;viewReset();}
+  lastCenter=ST.center_khz;
   $('freq').innerHTML=(ST.tune_khz||ST.center_khz).toFixed(2)+'<small> kHz</small>';
   $('bandlbl').textContent=ST.band+' · '+ST.mode;
   const lk=$('lock');lk.textContent=ST.lock;lk.className='chip '+ST.lock;
@@ -818,13 +883,24 @@ async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;
   list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-cur)<0.3;
     const tag=x.cw===true?`<span class=cwtag>&check;CW ${x.wpm}</span>`:(x.cw===false?'<span class="cwtag off">data/busy</span>':'<span class="cwtag off">…</span>');
     return `<div class="sig${on?' on':''}${x.cw===false?' dim':''}" onclick="tune(${x.khz})"><span>${x.khz.toFixed(2)}</span>${tag}<span class=bar><span style="width:${Math.min(100,x.snr*3)}%"></span></span><span class=snr>${x.snr}dB</span></div>`;}).join(''):'<div class=sub style="padding:8px">no CW carriers here — try another band</div>';}
-// click a canvas -> snap to the local peak near the click (point-and-click nav)
-function snap(e,c){const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
-  if(!DB.length||!ST.center_khz)return;
-  let i0=Math.floor(fx*DB.length),lo=Math.max(0,i0-12),hi=Math.min(DB.length,i0+12),bi=i0,bv=-1e9;
-  for(let i=lo;i<hi;i++)if(DB[i]>bv){bv=DB[i];bi=i;}   // snap to the peak nearest the click
-  const span=ST.span||250,f=ST.center_khz-span/2+(bi/DB.length)*span;tune(f.toFixed(2));}
-spec.onclick=e=>snap(e,spec);wf.onclick=e=>snap(e,wf);
+// left-click a canvas -> snap to the local peak near the click (point-and-click nav)
+function snap(e,c){if(e.button&&e.button!==0)return;if(!DB.length||VC===null)return;
+  const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
+  let i0=Math.floor(fx*DB.length),w=Math.max(4,Math.round(DB.length*0.02)); // ±2% window
+  let lo=Math.max(0,i0-w),hi=Math.min(DB.length,i0+w),bi=i0,bv=-1e9;
+  for(let i=lo;i<hi;i++)if(DB[i]>bv){bv=DB[i];bi=i;}
+  const f=VC-VS/2+(bi/DB.length)*VS;tune(f.toFixed(2));}
+for(const c of [spec,wf]){
+  c.addEventListener('click',e=>snap(e,c));
+  c.addEventListener('wheel',onWheel,{passive:false});
+  c.addEventListener('mousedown',onPanStart);
+  c.addEventListener('mousemove',onPanMove);
+  c.addEventListener('dblclick',e=>{e.preventDefault();viewReset();});
+  c.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});
+}
+addEventListener('mouseup',onPanEnd);
+// suppress middle-click autoscroll on the canvases
+for(const c of [spec,wf])c.addEventListener('pointerdown',e=>{if(e.button===1)e.preventDefault();});
 let listening=false;
 function togListen(){const a=$('au');listening=!listening;$('listenb').classList.toggle('on',listening);
   if(listening){a.src='/cw_audio.wav?'+Date.now();a.play().catch(()=>{});$('listenb').innerHTML='&#9632; STOP audio';}
@@ -834,8 +910,11 @@ function oled(t){t=Math.max(0,Math.min(1,t));const g2=Math.pow(t,1.4);
   const r=255*Math.pow(Math.max(0,(g2-0.5)*2),1.3),g=255*Math.min(1,g2*1.85),b=255*Math.min(1,g2*1.6);
   return[r|0,g|0,b|0];}
 async function draw(){
-  let s;try{s=await api('/spectrum');}catch(e){setTimeout(draw,300);return;}
-  const db=s.db;DB=db;if(!db.length){setTimeout(draw,150);return;}
+  const zoomed=(VIEW.c!==null&&VIEW.s<FULLSPAN-0.5);
+  const q=zoomed?('?vc='+VIEW.c.toFixed(2)+'&vs='+VIEW.s.toFixed(2)):'';
+  let s;try{s=await api('/spectrum'+q);}catch(e){setTimeout(draw,300);return;}
+  if(!q){SDRCENTER=s.center;FULLSPAN=s.span;if(VIEW.c===null){VIEW.c=s.center;VIEW.s=s.span;}}
+  const db=s.db;DB=db;VC=s.center;VS=s.span;if(!db.length){setTimeout(draw,150);return;}
   const w=spec.width,h=spec.height;sx.clearRect(0,0,w,h);
   sx.strokeStyle='#0c1a22';for(let i=0;i<=4;i++){const y=h*i/4;sx.beginPath();sx.moveTo(0,y);sx.lineTo(w,y);sx.stroke();}
   const lo=s.noise-6,hi=s.peak+6,rng=Math.max(6,hi-lo);
@@ -846,10 +925,17 @@ async function draw(){
   for(let x=0;x<cwd;x++){const i=Math.floor(x/cwd*db.length);let v=(db[i]-lo)/rng;const c=oled(v);
     row.data[x*4]=c[0];row.data[x*4+1]=c[1];row.data[x*4+2]=c[2];row.data[x*4+3]=255;}
   wx.putImageData(row,0,0);
-  // tuning cursor overlay (spans spectrum + waterfall) at the cursor freq
+  // tuning cursor overlay (spans spectrum + waterfall); hidden if panned off-view
   const cl=$('curline');
-  if(ST.tune_khz&&s.span){const cx=(ST.tune_khz-(s.center-s.span/2))/s.span*w;
+  if(ST.tune_khz&&VS){const cx=(ST.tune_khz-(VC-VS/2))/VS*w;
+    const vis=cx>=0&&cx<=w;cl.style.display=vis?'block':'none';
     cl.style.left=cx+'px';cl.style.background=ST.chlock?'#f0b23a':'rgba(255,255,255,.92)';}
+  // zoom readout + controls hint (top-left of the spectrum)
+  sx.fillStyle='rgba(120,200,220,.85)';sx.font='11px ui-monospace,monospace';
+  const zt=(VS<FULLSPAN-0.5?('🔍 '+VS.toFixed(1)+' kHz span'):('full '+VS.toFixed(0)+' kHz'));
+  sx.fillText(zt,8,15);
+  sx.fillStyle='rgba(120,150,170,.6)';
+  sx.fillText('scroll: zoom · middle-drag: pan · dbl-click: reset',8,h-8);
   setTimeout(draw,140);
 }
 refresh();setInterval(refresh,1500);draw();
