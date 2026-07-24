@@ -534,19 +534,23 @@ class Decoder(threading.Thread):
                 res = {"text": "", "wpm": 0, "q": 0, "conf": 0, "elements": 0,
                        "hint": f"decode err: {e}"[:80], "offset_hz": 0}
             res["mode"] = STATE["mode"]; res["ts"] = time.time()
-            with _lock:
-                DECODE.update(res)
-                if res["text"]:
-                    TRANSCRIPT.append({"ts": time.strftime("%H:%M:%S"),
-                                       "text": res["text"], "q": res["q"]})
-                    snr = round(max(0, SPEC["peak_db"] - SPEC["noise_db"]), 1)
-            if res.get("text") and res["mode"] == "CW":
-                got = log_calls(extract_calls(res["text"]), STATE["band"],
-                                STATE["center_khz"], snr)
-                if got:
-                    res["new_calls"] = [g["call"] for g in got]
-                    with _lock:
-                        DECODE["new_calls"] = res["new_calls"]
+            try:                                       # never let a post-decode bug kill this thread
+                snr = 0.0
+                with _lock:
+                    DECODE.update(res)
+                    if res["text"]:
+                        TRANSCRIPT.append({"ts": time.strftime("%H:%M:%S"),
+                                           "text": res["text"], "q": res["q"]})
+                        snr = round(max(0, SPEC["peak_db"] - SPEC["noise_db"]), 1)
+                if res.get("text") and res["mode"] == "CW":
+                    got = log_calls(extract_calls(res["text"]), STATE["band"],
+                                    STATE["center_khz"], snr)
+                    if got:
+                        res["new_calls"] = got         # log_calls returns a list of call strings
+                        with _lock:
+                            DECODE["new_calls"] = got
+            except Exception as e:
+                STATE["err"] = f"decode-post: {e}"[:100]
 
 
 class Verifier(threading.Thread):
