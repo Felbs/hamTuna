@@ -234,7 +234,9 @@ def decode_cw(iq):
     s = iq[:int(FS)] if len(iq) > FS else iq
     n = np.arange(len(s))
     x = (s * np.exp(-2j * np.pi * base / FS * n)).astype(np.complex64)
-    off = base + cw.find_offset(x, FS, 400)
+    off = base + cw.find_offset(x, FS, 700)   # find the carrier within +/-700 Hz of the
+    #                                           cursor (was 400) so a slightly-off click
+    #                                           still lands the decode ON the signal you hear
     if not STATE["chlock"]:
         STATE["last_off"] = off
     env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
@@ -1020,8 +1022,8 @@ async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;
 function snap(e,c){if(e.button&&e.button!==0)return;if(VC===null)return;
   const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
   const f=VC-VS/2+fx*VS;
-  const win=(VS*0.02).toFixed(3);         // snap window = 2% of the view -> precise when zoomed in
-  api('/tune?snap=1&khz='+f.toFixed(3)+'&win='+win).then(refresh);}
+  const win=Math.min(3,Math.max(0.5,VS*0.02)).toFixed(3);  // snap to the true carrier within
+  api('/tune?snap=1&khz='+f.toFixed(3)+'&win='+win).then(refresh);}  // >=500Hz so a near click grabs the signal
 // Controls: SCROLL = zoom, MIDDLE-DRAG = pan, LEFT-CLICK = snap cursor to signal,
 // DOUBLE-CLICK = reset to full band. (Middle-click autoscroll fully suppressed.)
 for(const c of [spec,wf]){
