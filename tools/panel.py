@@ -693,6 +693,37 @@ class H(BaseHTTPRequestHandler):
                 STATE["tune_khz"] = pick["khz"]; STATE["chlock"] = False
             self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"],
                                    "found_cw": bool(cw_sigs), "n_cw": len(cw_sigs)}))
+        elif u.path == "/scanbands":
+            # LIVE all-bands scan: hop each CW band, count copyable CW (open eye),
+            # then tune to the best. Bounded + exception-safe (won't hang the server).
+            orig = (STATE["band"], STATE["center_khz"])
+            results = []
+            try:
+                for band, ctr in BANDS.items():
+                    STATE["band"] = band; STATE["center_khz"] = float(ctr)  # reader retunes
+                    time.sleep(1.6)                                          # settle + fill SPEC
+                    iq = ring_snapshot(2)
+                    cwc, best_eye = 0, 0.0
+                    if iq is not None:
+                        for s in sorted(detect_signals(), key=lambda x: -x["snr"])[:6]:
+                            try:
+                                env, aud = envelope_locked(iq, (s["khz"] - ctr) * 1000.0)
+                                eye = cw_quality.eye_opening(env)[0]
+                                best_eye = max(best_eye, eye)
+                                if eye >= cw_quality.Q_READABLE:
+                                    cwc += 1
+                            except Exception:
+                                pass
+                    results.append({"band": band, "cw": cwc, "eye": round(float(best_eye), 1)})
+            except Exception as e:
+                STATE["err"] = f"scan: {e}"[:80]
+            best = max(results, key=lambda r: (r["cw"], r["eye"])) if results else None
+            if best and (best["cw"] > 0 or best["eye"] >= cw_quality.Q_READABLE):
+                STATE["band"] = best["band"]; STATE["center_khz"] = float(BANDS[best["band"]])
+                STATE["tune_khz"] = STATE["center_khz"]; STATE["chlock"] = False
+            else:                                     # nothing copyable anywhere -> restore
+                STATE["band"], STATE["center_khz"] = orig
+            self._send(json.dumps({"results": results, "best": best}))
         elif u.path == "/tune":                # move the CURSOR within the window
             try:
                 khz = float(q["khz"][0])
@@ -826,6 +857,9 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .advout{font-size:12px}.advrow{display:flex;gap:6px;flex-wrap:wrap;margin:3px 0}
 .advband{background:#0b141c;border:1px solid #14303a;padding:3px 8px;border-radius:10px;cursor:pointer}
 .advband:hover{background:#14303a}.advband b{color:var(--good)}
+.advband.good{border-color:var(--good);color:var(--good)}
+.scanb{background:#1a2740;color:#9db8ff;border:1px solid #2a3f6a;width:100%;padding:9px;font-size:12px;font-weight:600;margin-top:4px}
+.scanb:hover{background:#22335a}.scanb:disabled{opacity:.6;cursor:wait}
 .listen{width:100%;padding:9px;font-size:13px;font-weight:700}.listen.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .lockb{width:100%;padding:9px;font-size:13px;font-weight:700}.lockb.on{background:var(--warn);color:#1a1204;border-color:var(--warn)}
 .siglist{background:#000;border:1px solid var(--hair);border-radius:8px;max-height:150px;overflow-y:auto}
@@ -867,7 +901,9 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
     <button class=advb onclick=advise()>📡 Where's the CW right now?</button>
     <div class=advout id=advout></div>
     <div><div class=lbl>Mode</div><div class=row id=modes></div></div>
-    <button class=autob id=autob onclick=autotune()>&#9673; AUTO-TUNE (best copyable CW)</button>
+    <button class=autob id=autob onclick=autotune()>&#9673; AUTO-TUNE (this band)</button>
+    <button class=scanb id=scanb onclick=scanBands()>&#128270; SCAN ALL BANDS for CW</button>
+    <div class=advout id=scanout></div>
     <button class=lockb id=lockb onclick=togLock()>&#128275; LOCK channel</button>
     <div>
       <div class=lbl style="display:flex;justify-content:space-between;align-items:center">
@@ -1004,6 +1040,16 @@ async function autotune(){
   b.textContent = r.found_cw ? ('◉ jumped to CW ('+r.n_cw+' copyable)') : '◉ no copyable CW here — try 40m / evening';
   setTimeout(()=>{b.textContent=lbl;}, 2200);
 }
+async function scanBands(){
+  const b=$('scanb'),lbl=b.textContent,o=$('scanout');
+  b.disabled=true;b.textContent='… scanning all bands (~15s) …';o.innerHTML='<span class=sub>hopping bands, listening for CW…</span>';
+  let r;try{r=await api('/scanbands');}catch(e){b.disabled=false;b.textContent=lbl;return;}
+  await refresh();
+  const rows=(r.results||[]).map(x=>`<span class="advband${x.cw>0?' good':''}" onclick="set('band='+'${x.band}')">${x.band} ${x.cw>0?('✓'+x.cw):('eye'+x.eye)}</span>`).join('');
+  o.innerHTML=`<div class=advrow>${rows}</div>`+
+    (r.best&&(r.best.cw>0)?`<div class=sub>tuned to ${r.best.band} (${r.best.cw} copyable CW)</div>`
+      :'<div class=sub>no copyable CW on any band right now — try again this evening</div>');
+  b.disabled=false;b.textContent=lbl;}
 async function advise(){let s;try{s=await api('/advisor');}catch(e){return;}
   const o=$('advout');
   const fmt=a=>a.length?a.map(([b,n])=>`<span class=advband onclick="set('band='+'${b}')">${b} <b>${n}</b></span>`).join(''):'<span class=sub>no history yet</span>';
