@@ -31,7 +31,8 @@ import hamdb
 
 FS = 250_000.0
 OUT = HERE.parent / "lab" / "cw_harvest"
-EYE_TRIP = 2.6          # eye-opening that counts as "copyable CW present" (readable knee)
+EYE_TRIP = 2.0          # trip lower so we grab the FULL quality range (rough -> clean),
+#                         not just clean CW — we want both tiers for training/robustness
 HANG_S = 8.0            # keep recording this long after the eye last closed
 MAX_REC_S = 120.0       # cap a single recording (250 kHz cs16 = ~1 MB/s -> ~120 MB)
 CHUNK_S = 4.0           # monitor/record granularity
@@ -90,8 +91,12 @@ def label_and_save(iq, khz, meta):
     inter[0::2] = np.clip(iq.real * 32768, -32768, 32767).astype(np.int16)
     inter[1::2] = np.clip(iq.imag * 32768, -32768, 32767).astype(np.int16)
     inter.tofile(str(base) + ".cs16")
+    # quality tier for training stratification: HIGH (clean, labelable) / MID / LOW (rough)
+    quality = "high" if eye >= 3.5 else ("mid" if eye >= 2.5 else "low")
+    label_conf = "verified" if verified else ("decode" if eye >= 3.0 else "none")
     sidecar = {"iq_file": base.name + ".cs16", "khz": khz, "secs": round(len(iq) / FS, 1),
                "text": text, "raw": raw, "wpm": info.get("wpm", 0), "eye": round(float(eye), 2),
+               "quality": quality, "label_conf": label_conf,
                "verified_calls": verified, **meta}
     (Path(str(base) + ".json")).write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
     tag = f" calls={[v['call'] for v in verified]}" if verified else ""
