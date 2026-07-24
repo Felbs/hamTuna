@@ -32,6 +32,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
 import cw
+import hamdb
 try:
     import radio_lock
 except Exception:
@@ -87,9 +88,15 @@ def detect_signals():
             merged.append((f, s))
     return [{"khz": f, "snr": s} for f, s in merged]
 
-STATE = {"center_khz": 14030.0, "band": "20m", "mode": "CW", "ifgr": 30,
-         "rfsel": 0, "running": True, "antenna": "Antenna C", "lock": "none", "err": "",
-         "chlock": False, "lock_off": 0.0, "cw_off": 0.0}   # chlock = channel lock
+STATE = {"center_khz": 14030.0, "tune_khz": 14030.0, "band": "20m", "mode": "CW",
+         "ifgr": 30, "rfsel": 0, "running": True, "antenna": "Antenna C",
+         "lock": "none", "err": "", "chlock": False, "lock_off": 0.0, "last_off": 0.0}
+# center_khz = the SDR/display center (the window); tune_khz = the CURSOR (the
+# exact freq we decode/listen to, movable within the window, SDRuno-style).
+
+
+def cur_off_hz():
+    return (STATE["tune_khz"] - STATE["center_khz"]) * 1000.0
 SPEC = {"db": [0.0] * DISP_BINS, "peak_db": -120.0, "noise_db": -120.0, "ts": 0.0}
 DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0}
@@ -99,12 +106,12 @@ _lock = threading.Lock()
 _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
 _lp = firwin(159, 1500.0 / (FS / 2)).astype(np.float32)   # audio CW filter
-_narrow8k = firwin(129, 250.0 / 4000.0).astype(np.float32)  # ±250 Hz single-station filter @8 kHz
+_narrow8k = firwin(129, 400.0 / 4000.0).astype(np.float32)  # ±400 Hz single-station filter @8 kHz
 
 
 def envelope_locked(iq, off_hz, aud=8000):
-    """Isolate ONE station: shift its carrier to DC, keep only ±250 Hz (rejects
-    adjacent CW), then envelope — so a locked channel copies just that QSO."""
+    """Isolate ONE station: shift its carrier to DC, keep only ±400 Hz (rejects
+    adjacent CW), then envelope — so the cursor copies just that one signal."""
     from math import gcd
     from scipy.signal import resample_poly
     n = np.arange(len(iq), dtype=np.float64)
@@ -165,15 +172,17 @@ def _spectrum(iq):
 
 def decode_cw(iq):
     if STATE["chlock"]:
-        # LOCKED: pinned to one station — no re-hunt, tight ±250 Hz filter,
-        # so we follow that single QSO cleanly even as neighbors come and go.
-        off = STATE["lock_off"]
-        env, aud = envelope_locked(iq, off)
+        off = STATE["lock_off"]           # pinned
     else:
-        # NARROW search: decode the signal you TUNED to (near center), not a
-        # distant strong FT8/data carrier a wide search would grab instead.
-        off = cw.find_offset(iq, FS, search=4000)
-        env, aud = cw.envelope(iq, FS, off)
+        co = cur_off_hz()                 # the cursor position
+        # snap to the nearest carrier within ±400 Hz of the cursor (tight enough
+        # not to grab an adjacent station; click-to-peak lands you within a bin).
+        s = iq[:int(FS)] if len(iq) > FS else iq
+        n = np.arange(len(s))
+        x = (s * np.exp(-2j * np.pi * co / FS * n)).astype(np.complex64)
+        off = co + cw.find_offset(x, FS, 400)
+        STATE["last_off"] = off           # remember the real carrier (LOCK pins this)
+    env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
     txt, info = cw.decode_env(env, aud)
     chars = [c for c in txt if c != " "]
     q = round(sum(1 for c in chars if c != "?") / len(chars), 3) if chars else 0.0
@@ -230,35 +239,66 @@ def _load_log():
         pass
 
 
+def _save_log():
+    try:
+        LOGFILE.parent.mkdir(exist_ok=True)
+        with open(LOGFILE, "w", encoding="utf-8") as f:
+            for r in LOGBOOK.values():
+                f.write(json.dumps(r) + "\n")
+    except Exception:
+        pass
+
+
 def log_calls(calls, band, khz, snr):
+    """Log heard calls as PENDING (0 pts). Points come only after the verifier
+    confirms the call is a real ham — a decode artifact that matches the pattern
+    but isn't a licensed call never scores."""
     new = []
     for c in calls:
         if c in LOGBOOK:
             LOGBOOK[c]["count"] += 1
             if band not in LOGBOOK[c]["bands"]:
-                LOGBOOK[c]["bands"].append(band); LOGBOOK[c]["points"] += 3  # new band = +3
+                LOGBOOK[c]["bands"].append(band)
+                if LOGBOOK[c].get("verified"):
+                    LOGBOOK[c]["points"] += 3        # new band on a real call
         else:
-            prefix = re.match(r"[A-Z0-9]*[0-9]", c).group()
-            rare = 5 if not any(v["call"].startswith(prefix[:2]) for v in LOGBOOK.values()) else 0
-            rec = {"call": c, "first": time.strftime("%Y-%m-%d %H:%M"),
-                   "bands": [band], "khz": khz, "count": 1, "snr": snr,
-                   "points": 10 + rare}          # 10 base, +5 new prefix
-            LOGBOOK[c] = rec; new.append(rec)
+            LOGBOOK[c] = {"call": c, "first": time.strftime("%Y-%m-%d %H:%M"),
+                          "bands": [band], "khz": khz, "count": 1, "snr": snr,
+                          "verified": None, "name": "", "qth": "", "points": 0,
+                          "tries": 0}
+            new.append(c)
     if new:
-        try:
-            LOGFILE.parent.mkdir(exist_ok=True)
-            with open(LOGFILE, "a", encoding="utf-8") as f:
-                for r in new:
-                    f.write(json.dumps(r) + "\n")
-        except Exception:
-            pass
+        _save_log()
     return new
 
 
+def verify_pending():
+    """Check pending calls against the ham DB; score only the real ones."""
+    changed = False
+    for c, r in list(LOGBOOK.items()):
+        if r.get("verified") is None and r.get("tries", 0) < 4:
+            res = hamdb.verify(c)
+            r["tries"] = r.get("tries", 0) + 1
+            if res["status"] == "VALID":
+                prefix = re.match(r"[A-Z0-9]*[0-9]", c).group()[:2]
+                rare = 0 if any(v.get("verified") and v["call"] != c
+                                and v["call"].startswith(prefix) for v in LOGBOOK.values()) else 5
+                r.update({"verified": True, "name": res["name"], "qth": res["qth"],
+                          "points": 10 + rare + 3 * (len(r["bands"]) - 1)})
+                changed = True
+            elif res["status"] == "INVALID":
+                r["verified"] = False                # decode artifact — never scores
+                changed = True
+    if changed:
+        _save_log()
+    return changed
+
+
 def log_summary():
-    calls = list(LOGBOOK.values())
-    return {"score": sum(c["points"] for c in calls), "count": len(calls),
-            "calls": sorted(calls, key=lambda c: c["first"], reverse=True)[:30]}
+    v = [c for c in LOGBOOK.values() if c.get("verified")]
+    pend = sum(1 for c in LOGBOOK.values() if c.get("verified") is None)
+    return {"score": sum(c["points"] for c in v), "count": len(v), "pending": pend,
+            "calls": sorted(v, key=lambda c: c["first"], reverse=True)[:30]}
 
 
 class SDRWorker(threading.Thread):
@@ -280,8 +320,8 @@ class SDRWorker(threading.Thread):
     def _audio(self, iq):
         """Continuous-phase BFO -> narrow LP -> decimate -> int16 CW audio."""
         n = np.arange(len(iq), dtype=np.float64)
-        off = STATE["lock_off"] if STATE["chlock"] else STATE["cw_off"]
-        mixf = BFO_HZ - off                    # bring carrier to BFO pitch
+        off = STATE["lock_off"] if STATE["chlock"] else cur_off_hz()
+        mixf = BFO_HZ - off                    # bring cursor's carrier to BFO pitch
         nco = np.exp(1j * (2 * np.pi * mixf / FS * n + self.aud_phase)).astype(np.complex64)
         self.aud_phase = (self.aud_phase + 2 * np.pi * mixf / FS * len(iq)) % (2 * np.pi)
         xr = (iq * nco).real.astype(np.float32)
@@ -328,14 +368,7 @@ class SDRWorker(threading.Thread):
                     SPEC["db"] = db.tolist(); SPEC["peak_db"] = float(db.max())
                     SPEC["noise_db"] = float(np.percentile(db, 25)); SPEC["ts"] = time.time()
             if STATE["mode"] == "CW":
-                # track the carrier for the BFO — but NOT while locked (stay put)
-                if not STATE["chlock"] and time.time() - last_off > 1.5:
-                    last_off = time.time()
-                    snap = ring_snapshot(1.0)
-                    if snap is not None:
-                        try: STATE["cw_off"] = cw.find_offset(snap, FS, 4000)
-                        except Exception: pass
-                self._audio(iq)
+                self._audio(iq)            # BFO follows the cursor (cur_off_hz)
             if radio_lock:
                 radio_lock.heartbeat()
         try:
@@ -382,6 +415,20 @@ class Decoder(threading.Thread):
                         DECODE["new_calls"] = res["new_calls"]
 
 
+class Verifier(threading.Thread):
+    """Off-thread: check pending logged calls against the ham DB (network),
+    so verification never blocks decode."""
+    daemon = True
+
+    def run(self):
+        while True:
+            time.sleep(5)
+            try:
+                verify_pending()
+            except Exception:
+                pass
+
+
 def _wav_header(nbytes=0x7FFFF000):
     return (b"RIFF" + struct.pack("<I", nbytes + 36) + b"WAVEfmt " +
             struct.pack("<IHHIIHH", 16, 1, 1, AUD_FS, AUD_FS * 2, 2, 16) +
@@ -412,18 +459,21 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/state":
             with _lock:
                 self._send(json.dumps({**{k: STATE[k] for k in
-                    ("center_khz", "band", "mode", "ifgr", "running", "lock", "err", "chlock")},
+                    ("center_khz", "tune_khz", "band", "mode", "ifgr", "running",
+                     "lock", "err", "chlock")}, "span": SPAN_KHZ,
                     "decode": dict(DECODE), "bands": BANDS, "modes": MODES,
                     "transcript": list(TRANSCRIPT)[-14:],
                     "smeter": round(max(0, (SPEC["peak_db"] - SPEC["noise_db"])), 1)}))
         elif u.path == "/set":
             if "band" in q and q["band"][0] in BANDS:
-                STATE["band"] = q["band"][0]; STATE["center_khz"] = float(BANDS[q["band"][0]])
-                STATE["chlock"] = False              # changing channel releases the lock
+                STATE["band"] = q["band"][0]
+                STATE["center_khz"] = float(BANDS[q["band"][0]])
+                STATE["tune_khz"] = STATE["center_khz"]     # cursor to band center
+                STATE["chlock"] = False
             if "center" in q:
                 try:
                     STATE["center_khz"] = round(float(q["center"][0]), 2)
-                    STATE["chlock"] = False
+                    STATE["tune_khz"] = STATE["center_khz"]; STATE["chlock"] = False
                 except ValueError: pass
             if "mode" in q and q["mode"][0] in MODES:
                 STATE["mode"] = q["mode"][0]
@@ -433,31 +483,38 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/autotune":
             sigs = detect_signals()          # strongest CW carrier in-band (not FT8)
             if sigs:
-                STATE["center_khz"] = max(sigs, key=lambda s: s["snr"])["khz"]
+                STATE["tune_khz"] = max(sigs, key=lambda s: s["snr"])["khz"]  # cursor jumps
                 STATE["chlock"] = False
-            self._send(json.dumps({"ok": True, "center": STATE["center_khz"]}))
+            self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"]}))
+        elif u.path == "/tune":                # move the CURSOR within the window
+            try:
+                lo = STATE["center_khz"] - SPAN_KHZ / 2 + 1
+                hi = STATE["center_khz"] + SPAN_KHZ / 2 - 1
+                STATE["tune_khz"] = round(min(hi, max(lo, float(q["khz"][0]))), 2)
+                STATE["chlock"] = False
+            except (ValueError, KeyError): pass
+            self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"]}))
         elif u.path == "/signals":
-            self._send(json.dumps({"signals": detect_signals(), "center": STATE["center_khz"]}))
+            self._send(json.dumps({"signals": detect_signals(),
+                                   "center": STATE["center_khz"], "tune": STATE["tune_khz"]}))
         elif u.path == "/log":
             self._send(json.dumps(log_summary()))
         elif u.path == "/lock":
             if q.get("on", ["1"])[0] == "1":
-                STATE["lock_off"] = STATE["cw_off"]   # pin the carrier we're on
+                STATE["lock_off"] = STATE.get("last_off") or cur_off_hz()  # pin the real carrier
                 STATE["chlock"] = True
             else:
                 STATE["chlock"] = False
             self._send(json.dumps({"ok": True, "chlock": STATE["chlock"]}))
-        elif u.path == "/step":
+        elif u.path == "/step":                # step the cursor to prev/next signal
             d = q.get("d", ["1"])[0]
             freqs = sorted(s["khz"] for s in detect_signals())
             if freqs:
-                c = STATE["center_khz"]
-                if d == "1":
-                    STATE["center_khz"] = next((f for f in freqs if f > c + 0.25), freqs[0])
-                else:
-                    STATE["center_khz"] = next((f for f in reversed(freqs) if f < c - 0.25), freqs[-1])
+                t = STATE["tune_khz"]
+                STATE["tune_khz"] = (next((f for f in freqs if f > t + 0.25), freqs[0]) if d == "1"
+                                     else next((f for f in reversed(freqs) if f < t - 0.25), freqs[-1]))
                 STATE["chlock"] = False
-            self._send(json.dumps({"ok": True, "center": STATE["center_khz"]}))
+            self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"]}))
         elif u.path == "/cw_audio.wav":
             self._stream_audio()
         else:
@@ -491,6 +548,7 @@ def main():
     _load_log()
     SDRWorker().start()
     Decoder().start()
+    Verifier().start()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 
 
@@ -502,7 +560,8 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>hamTuna</title>
 .freq{font-size:30px;font-weight:700;letter-spacing:.04em;color:#fff;text-shadow:0 0 14px rgba(46,230,200,.4)}
 .freq small{font-size:13px;color:var(--mut)}.sub{color:var(--mut);font-size:12px}
 .wrap{display:grid;grid-template-columns:1fr 320px;height:calc(100vh - 52px)}
-.left{display:flex;flex-direction:column;min-width:0}
+.left{display:flex;flex-direction:column;min-width:0;position:relative}
+.curline{position:absolute;top:0;bottom:0;width:2px;pointer-events:none;background:#fff;box-shadow:0 0 8px currentColor;z-index:5;transition:left .12s}
 #spec{background:#000;flex:0 0 190px;width:100%;cursor:crosshair}#wf{background:#000;flex:1;width:100%;cursor:crosshair}
 .side{border-left:1px solid var(--hair);background:var(--panel);padding:12px;overflow-y:auto;display:flex;flex-direction:column;gap:13px}
 .row{display:flex;flex-wrap:wrap;gap:6px}
@@ -544,7 +603,7 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
   <div class=sub>click a signal &rarr; snap to its peak</div>
 </div>
 <div class=wrap>
-  <div class=left><canvas id=spec></canvas><canvas id=wf></canvas></div>
+  <div class=left><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div></div>
   <div class=side>
     <div><div class=lbl>Band</div><div class=row id=bands></div></div>
     <div><div class=lbl>Mode</div><div class=row id=modes></div></div>
@@ -587,7 +646,7 @@ async function api(p){return (await fetch(p)).json();}
 let DB=[];
 async function refresh(){
   ST=await api('/state');
-  $('freq').innerHTML=ST.center_khz.toFixed(2)+'<small> kHz</small>';
+  $('freq').innerHTML=(ST.tune_khz||ST.center_khz).toFixed(2)+'<small> kHz</small>';
   $('bandlbl').textContent=ST.band+' · '+ST.mode;
   const lk=$('lock');lk.textContent=ST.lock;lk.className='chip '+ST.lock;
   $('lockb').classList.toggle('on',ST.chlock);
@@ -612,24 +671,27 @@ async function refresh(){
   $('newcall').textContent=(d.new_calls&&d.new_calls.length)?('🎉 logged '+d.new_calls.join(' ')):'';
 }
 async function pollLog(){let s;try{s=await api('/log');}catch(e){return;}
-  $('score').textContent=s.score;$('logcount').textContent=s.count+' calls';
+  $('score').textContent=s.score;
+  $('logcount').textContent=s.count+' verified'+(s.pending?(' · '+s.pending+' pending'):'');
   $('loglist').innerHTML=(s.calls||[]).length?(s.calls).map(c=>
-    `<div class=logrow><span class=call>${c.call}</span><span class=meta>${c.bands.join('/')} &middot; &times;${c.count} &middot; ${c.points}pt</span></div>`).join('')
-    :'<div class=sub>no calls yet — tune in a CQ and collect \'em</div>';}
+    `<div class=logrow><span class=call>&check; ${c.call}</span><span class=meta>${(c.name||'').split(' ')[0]} &middot; ${c.bands.join('/')} &middot; ${c.points}pt</span></div>`).join('')
+    :'<div class=sub>no verified calls yet — tune in a CQ</div>';}
 async function set(kv){await api('/set?'+kv);refresh();}
 async function autotune(){await api('/autotune');refresh();}
 async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
 async function togLock(){await api('/lock?on='+(ST.chlock?0:1));refresh();}
+async function tune(khz){await api('/tune?khz='+khz);refresh();}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
-  list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-c)<0.3;
-    return `<div class="sig${on?' on':''}" onclick="set('center=${x.khz}')"><span>${x.khz.toFixed(2)}</span><span class=bar><span style="width:${Math.min(100,x.snr*3)}%"></span></span><span class=snr>${x.snr}dB</span></div>`;}).join(''):'<div class=sub style="padding:8px">no CW carriers here — try another band</div>';}
+  const cur=s.tune!==undefined?s.tune:c;
+  list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-cur)<0.3;
+    return `<div class="sig${on?' on':''}" onclick="tune(${x.khz})"><span>${x.khz.toFixed(2)}</span><span class=bar><span style="width:${Math.min(100,x.snr*3)}%"></span></span><span class=snr>${x.snr}dB</span></div>`;}).join(''):'<div class=sub style="padding:8px">no CW carriers here — try another band</div>';}
 // click a canvas -> snap to the local peak near the click (point-and-click nav)
 function snap(e,c){const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
   if(!DB.length||!ST.center_khz)return;
   let i0=Math.floor(fx*DB.length),lo=Math.max(0,i0-12),hi=Math.min(DB.length,i0+12),bi=i0,bv=-1e9;
-  for(let i=lo;i<hi;i++)if(DB[i]>bv){bv=DB[i];bi=i;}
-  const span=ST.span||250,f=ST.center_khz-span/2+(bi/DB.length)*span;set('center='+f.toFixed(2));}
+  for(let i=lo;i<hi;i++)if(DB[i]>bv){bv=DB[i];bi=i;}   // snap to the peak nearest the click
+  const span=ST.span||250,f=ST.center_khz-span/2+(bi/DB.length)*span;tune(f.toFixed(2));}
 spec.onclick=e=>snap(e,spec);wf.onclick=e=>snap(e,wf);
 let listening=false;
 function togListen(){const a=$('au');listening=!listening;$('listenb').classList.toggle('on',listening);
@@ -647,14 +709,15 @@ async function draw(){
   const lo=s.noise-6,hi=s.peak+6,rng=Math.max(6,hi-lo);
   sx.strokeStyle='#2ee6c8';sx.lineWidth=1.4;sx.shadowColor='#2ee6c8';sx.shadowBlur=6;sx.beginPath();
   for(let i=0;i<db.length;i++){const x=i/db.length*w,y=h-(db[i]-lo)/rng*h;i?sx.lineTo(x,y):sx.moveTo(x,y);}sx.stroke();sx.shadowBlur=0;
-  sx.strokeStyle='rgba(255,93,115,.5)';sx.beginPath();sx.moveTo(w/2,0);sx.lineTo(w/2,h);sx.stroke();
   const cwd=wf.width,ch=wf.height;wx.putImageData(wx.getImageData(0,0,cwd,ch),0,1);
   const row=wx.createImageData(cwd,1);
   for(let x=0;x<cwd;x++){const i=Math.floor(x/cwd*db.length);let v=(db[i]-lo)/rng;const c=oled(v);
     row.data[x*4]=c[0];row.data[x*4+1]=c[1];row.data[x*4+2]=c[2];row.data[x*4+3]=255;}
   wx.putImageData(row,0,0);
-  // center marker on waterfall
-  wx.fillStyle='rgba(255,93,115,.5)';wx.fillRect(cwd/2,0,1,2);
+  // tuning cursor overlay (spans spectrum + waterfall) at the cursor freq
+  const cl=$('curline');
+  if(ST.tune_khz&&s.span){const cx=(ST.tune_khz-(s.center-s.span/2))/s.span*w;
+    cl.style.left=cx+'px';cl.style.background=ST.chlock?'#f0b23a':'rgba(255,255,255,.92)';}
   setTimeout(draw,140);
 }
 refresh();setInterval(refresh,1500);draw();
