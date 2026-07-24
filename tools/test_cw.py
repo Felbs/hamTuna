@@ -95,6 +95,18 @@ def main():
                   f"{'REGRESSION' if reg else ('ROUTE-REG' if route_reg else 'ok')}  {txt[:28]!r}")
             fails += 1 if (reg or route_reg) else 0
 
+    # 3) Bayesian HSMM decoder self-test (guards cw_bayes.py stays working)
+    try:
+        import cw_bayes
+        env, a = cw_bayes._synth("PARIS", wpm=20, noise=0.15, jitter=0.0)
+        btxt = cw_bayes.decode_bayes(env, a)[0].replace(" ", "")
+        bok = btxt == "PARIS"
+        print(f"\n[bayes] synth PARIS -> {btxt!r:16} {'PASS' if bok else 'FAIL'}")
+        fails += 0 if bok else 1
+    except Exception as e:
+        print(f"\n[bayes] ERROR: {e}")
+        fails += 1
+
     print("\n" + "=" * 62)
     print(f"RESULT: {'ALL PASS' if fails == 0 else f'{fails} REGRESSION(S)'}")
     print("=" * 62)
