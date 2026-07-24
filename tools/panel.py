@@ -1027,7 +1027,9 @@ async function refresh(){
   $('declbl').textContent=ST.mode==='CW'?'Live Morse transcript':ST.mode+' decode';
   const xs=$('xscript');
   if(ST.mode==='CW'){
-    xs.innerHTML = d.text ? `<div class=xline>${d.text}</div>` : '<div class=sub>…listening for CW…</div>';
+    const tr=ST.transcript||[];    // rolling history so intermittent copy accumulates & stays visible
+    xs.innerHTML = tr.length ? tr.map(x=>`<span class=xline>${x.text} </span>`).join('')
+                  : (d.text?`<span class=xline>${d.text}</span>`:'<div class=sub>…listening for CW…</div>');
     xs.scrollTop=xs.scrollHeight;
   } else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
   $('hint').textContent=d.hint||'';
