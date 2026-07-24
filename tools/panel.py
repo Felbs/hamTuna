@@ -275,6 +275,7 @@ DECODERS = {"CW": decode_cw}
 
 # ── logbook: harvest callsigns like a real ham, and score them ──
 LOGFILE = HERE.parent / "lab" / "cw_log.jsonl"
+HARVEST_DIR = HERE.parent / "lab" / "cw_harvest"
 LOGBOOK = {}                       # call -> record
 CALL_RE = re.compile(r"^[A-Z0-9]{1,2}[0-9][A-Z]{1,4}$")
 PROSIGN = {"CQ", "DE", "QRL", "QSL", "QSO", "QTH", "QRZ", "QRM", "QRN", "QSB",
@@ -366,10 +367,54 @@ def verify_pending():
     return changed
 
 
+_KHZ2BAND = {3560: "80m", 5357: "60m", 7025: "40m", 10120: "30m", 14025: "20m",
+             18075: "17m", 21025: "15m", 24905: "12m", 28025: "10m"}
+
+
+def band_advice():
+    """Data-driven band advisor: from our OWN harvest history (what this antenna
+    actually heard, by band and UTC hour), tell the user where the CW is right now.
+    Beats a generic propagation chart — it's personalized to this rig/location."""
+    import glob
+    import json
+    from collections import Counter
+    now = time.gmtime().tm_hour
+    hrs = {(now - 1) % 24, now, (now + 1) % 24}
+    by_band, now_band = Counter(), Counter()
+    total = 0
+    for jf in glob.glob(str(HARVEST_DIR / "*.json")):
+        try:
+            d = json.loads(Path(jf).read_text())
+        except Exception:
+            continue
+        khz = d.get("khz", 0)
+        b = _KHZ2BAND.get(min(_KHZ2BAND, key=lambda k: abs(k - khz)), f"{khz:.0f}")
+        by_band[b] += 1; total += 1
+        ts = d.get("trip_utc", "")
+        try:
+            if int(ts[11:13]) in hrs:
+                now_band[b] += 1
+        except (ValueError, IndexError):
+            pass
+    return {"now_utc_hour": now, "total": total,
+            "best_now": now_band.most_common(4), "all_time": by_band.most_common(6)}
+
+
 def log_summary():
     v = [c for c in LOGBOOK.values() if c.get("verified")]
     pend = sum(1 for c in LOGBOOK.values() if c.get("verified") is None)
+    # progression stats — the things hams chase (prefixes~DXCC, bands, states/WAS)
+    prefixes, bands, states = set(), set(), set()
+    for c in v:
+        m = re.match(r"[A-Z0-9]*[0-9]", c["call"])
+        if m:
+            prefixes.add(m.group())
+        bands.update(c.get("bands", []))
+        st = re.search(r"\b([A-Z]{2})\b", c.get("qth", "") or "")
+        if st:
+            states.add(st.group(1))
     return {"score": sum(c["points"] for c in v), "count": len(v), "pending": pend,
+            "stats": {"prefixes": len(prefixes), "bands": len(bands), "states": len(states)},
             "calls": sorted(v, key=lambda c: c["first"], reverse=True)[:30]}
 
 
@@ -647,6 +692,8 @@ class H(BaseHTTPRequestHandler):
                                    "center": STATE["center_khz"], "tune": STATE["tune_khz"]}))
         elif u.path == "/log":
             self._send(json.dumps(log_summary()))
+        elif u.path == "/advisor":
+            self._send(json.dumps(band_advice()))
         elif u.path == "/lock":
             if q.get("on", ["1"])[0] == "1":
                 STATE["lock_off"] = cur_off_hz()      # pin the cursor; decode snaps ±400 to its carrier
@@ -726,6 +773,10 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .xline{color:var(--acc);word-break:break-word}
 .stat{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);padding:2px 0}.stat b{color:var(--ink)}
 .autob{background:var(--acc);color:#04110e;font-weight:700;width:100%;padding:10px;font-size:13px}
+.advb{background:#12303a;color:#7fd6e6;border:1px solid #1c4a58;width:100%;padding:8px;font-size:12px;margin-top:2px}
+.advout{font-size:12px}.advrow{display:flex;gap:6px;flex-wrap:wrap;margin:3px 0}
+.advband{background:#0b141c;border:1px solid #14303a;padding:3px 8px;border-radius:10px;cursor:pointer}
+.advband:hover{background:#14303a}.advband b{color:var(--good)}
 .listen{width:100%;padding:9px;font-size:13px;font-weight:700}.listen.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .lockb{width:100%;padding:9px;font-size:13px;font-weight:700}.lockb.on{background:var(--warn);color:#1a1204;border-color:var(--warn)}
 .siglist{background:#000;border:1px solid var(--hair);border-radius:8px;max-height:150px;overflow-y:auto}
@@ -737,6 +788,8 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 button.step{padding:2px 9px;font-size:13px;font-weight:700}
 .logbook{background:#060d13;border:1px solid var(--hair);border-radius:10px;padding:12px}
 .score{font-size:28px;font-weight:700;color:var(--good);text-shadow:0 0 12px rgba(58,209,122,.3)}.score small{font-size:12px;color:var(--mut);margin-left:5px}
+.logstats{display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--mut);margin:4px 0 2px}
+.logstats span{background:#0b141c;padding:2px 7px;border-radius:10px;cursor:default}
 .loglist{max-height:150px;overflow-y:auto;margin-top:6px}
 .logrow{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:4px 0;border-bottom:1px solid #0b141c}
 .logrow:last-child{border-bottom:none}.logrow .call{color:var(--acc);font-weight:700}.logrow .meta{color:var(--mut);font-size:10px}
@@ -756,6 +809,8 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
   <div class=left><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div></div>
   <div class=side>
     <div><div class=lbl>Band</div><div class=row id=bands></div></div>
+    <button class=advb onclick=advise()>📡 Where's the CW right now?</button>
+    <div class=advout id=advout></div>
     <div><div class=lbl>Mode</div><div class=row id=modes></div></div>
     <button class=autob id=autob onclick=autotune()>&#9673; AUTO-TUNE (best copyable CW)</button>
     <button class=lockb id=lockb onclick=togLock()>&#128275; LOCK channel</button>
@@ -785,6 +840,7 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
       <div class=lbl style="display:flex;justify-content:space-between;align-items:baseline">
         <span>&#128225; Logbook</span><span id=logcount class=sub></span></div>
       <div class=score><span id=score>0</span><small>pts</small></div>
+      <div class=logstats id=logstats></div>
       <div class=loglist id=loglist></div>
     </div>
     <div class=sub id=hint></div>
@@ -861,6 +917,10 @@ async function refresh(){
 async function pollLog(){let s;try{s=await api('/log');}catch(e){return;}
   $('score').textContent=s.score;
   $('logcount').textContent=s.count+' verified'+(s.pending?(' · '+s.pending+' pending'):'');
+  const st=s.stats||{};$('logstats').innerHTML=
+    `<span title="unique callsign prefixes (~DXCC)">🌐 ${st.prefixes||0} pfx</span>`+
+    `<span title="bands worked">📶 ${st.bands||0} bands</span>`+
+    `<span title="US states worked (WAS)">🗺️ ${st.states||0} states</span>`;
   $('loglist').innerHTML=(s.calls||[]).length?(s.calls).map(c=>
     `<div class=logrow><span class=call>&check; ${c.call}</span><span class=meta>${(c.name||'').split(' ')[0]} &middot; ${c.bands.join('/')} &middot; ${c.points}pt</span></div>`).join('')
     :'<div class=sub>no verified calls yet — tune in a CQ</div>';}
@@ -874,6 +934,13 @@ async function autotune(){
   b.textContent = r.found_cw ? ('◉ jumped to CW ('+r.n_cw+' copyable)') : '◉ no copyable CW here — try 40m / evening';
   setTimeout(()=>{b.textContent=lbl;}, 2200);
 }
+async function advise(){let s;try{s=await api('/advisor');}catch(e){return;}
+  const o=$('advout');
+  const fmt=a=>a.length?a.map(([b,n])=>`<span class=advband onclick="set('band='+'${b}')">${b} <b>${n}</b></span>`).join(''):'<span class=sub>no history yet</span>';
+  o.innerHTML=`<div class=sub>Your rig's CW, this hour (${String(s.now_utc_hour).padStart(2,'0')}:00Z), from ${s.total} captures:</div>`+
+    `<div class=advrow>${fmt(s.best_now)}</div>`+
+    `<div class=sub style="margin-top:4px">all-time by band:</div><div class=advrow>${fmt(s.all_time)}</div>`+
+    (s.best_now.length?'<div class=sub style="margin-top:4px">click a band to jump there</div>':'<div class=sub style="margin-top:4px">quiet this hour — CW peaks evenings/weekends on 40/80m</div>');}
 async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
 async function togLock(){await api('/lock?on='+(ST.chlock?0:1));refresh();}
 async function tune(khz){await api('/tune?khz='+khz);refresh();}
