@@ -853,7 +853,8 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
     <div class=zoomctl>
       <button onclick="zoomBy(0.6,0.5)" title="zoom in (narrower band)">+</button>
       <button onclick="zoomBy(1.7,0.5)" title="zoom out">&minus;</button>
-      <button onclick="viewReset()" title="full band">&#10530;</button>
+      <button onclick="centerCursor()" title="center on tuning cursor">&#9678;</button>
+      <button onclick="viewReset()" title="full band (double-click waterfall)">&#10530;</button>
     </div></div>
   <div class=side>
     <div><div class=lbl>Band</div><div class=row id=bands></div></div>
@@ -907,6 +908,7 @@ let VIEW={c:null,s:null}, VC=null, VS=null, FULLSPAN=250, SDRCENTER=null, wfDirt
 function viewInit(center,span){FULLSPAN=span;SDRCENTER=center;
   if(VIEW.c===null){VIEW.c=center;VIEW.s=span;}}
 function viewReset(){if(SDRCENTER!==null){VIEW.c=SDRCENTER;VIEW.s=FULLSPAN;wfDirty=true;}}
+function centerCursor(){if(ST.tune_khz){VIEW.c=ST.tune_khz;clampView();wfDirty=true;}}  // jump back to the cursor
 function clampView(){const half=VIEW.s/2, lo=SDRCENTER-FULLSPAN/2+half, hi=SDRCENTER+FULLSPAN/2-half;
   VIEW.s=Math.max(1,Math.min(FULLSPAN,VIEW.s));   // 1 kHz deepest zoom
   if(VIEW.s>=FULLSPAN){VIEW.c=SDRCENTER;}else{VIEW.c=Math.max(lo,Math.min(hi,VIEW.c));}}
@@ -1065,7 +1067,10 @@ async function draw(){
   if(ST.tune_khz&&VS){const cx=(ST.tune_khz-(VC-VS/2))/VS*w;
     const vis=cx>=-1&&cx<=w+1;cl.style.display=vis?'block':'none';
     const col=ST.chlock?'#f0b23a':'#ffd84a';        // amber locked / yellow otherwise (high contrast on the OLED waterfall)
-    cl.style.left=cx+'px';cl.style.background=col;cl.style.color=col;}
+    cl.style.left=cx+'px';cl.style.background=col;cl.style.color=col;
+    if(!vis){                                        // cursor panned off-view -> edge arrow pointing to it (click to recenter)
+      sx.fillStyle=col;sx.font='bold 15px system-ui';sx.textAlign=cx<0?'left':'right';
+      sx.fillText((cx<0?'◀ cursor':'cursor ▶'),cx<0?6:w-6,30);sx.textAlign='left';}}
   // frequency axis — the kHz labels visibly compress as you zoom (clear feedback)
   sx.fillStyle='rgba(150,185,205,.75)';sx.font='10px ui-monospace,monospace';sx.textAlign='center';
   for(let i=0;i<=4;i++){const fk=VC-VS/2+i/4*VS,x=Math.max(24,Math.min(w-24,i/4*w));
