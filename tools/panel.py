@@ -88,7 +88,8 @@ def detect_signals():
     return [{"khz": f, "snr": s} for f, s in merged]
 
 STATE = {"center_khz": 14030.0, "band": "20m", "mode": "CW", "ifgr": 30,
-         "rfsel": 0, "running": True, "antenna": "Antenna C", "lock": "none", "err": ""}
+         "rfsel": 0, "running": True, "antenna": "Antenna C", "lock": "none", "err": "",
+         "chlock": False, "lock_off": 0.0, "cw_off": 0.0}   # chlock = channel lock
 SPEC = {"db": [0.0] * DISP_BINS, "peak_db": -120.0, "noise_db": -120.0, "ts": 0.0}
 DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0}
@@ -97,7 +98,23 @@ AUDIO = deque(maxlen=AUD_FS * 4)
 _lock = threading.Lock()
 _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
-_lp = firwin(159, 1500.0 / (FS / 2)).astype(np.float32)   # narrow CW filter
+_lp = firwin(159, 1500.0 / (FS / 2)).astype(np.float32)   # audio CW filter
+_narrow8k = firwin(129, 250.0 / 4000.0).astype(np.float32)  # ±250 Hz single-station filter @8 kHz
+
+
+def envelope_locked(iq, off_hz, aud=8000):
+    """Isolate ONE station: shift its carrier to DC, keep only ±250 Hz (rejects
+    adjacent CW), then envelope — so a locked channel copies just that QSO."""
+    from math import gcd
+    from scipy.signal import resample_poly
+    n = np.arange(len(iq), dtype=np.float64)
+    x = (iq * np.exp(-2j * np.pi * off_hz / FS * n)).astype(np.complex64)
+    g = gcd(int(aud), int(FS))
+    xr = resample_poly(x, int(aud) // g, int(FS) // g)      # complex -> 8 kHz
+    xf = lfilter(_narrow8k, 1.0, xr)                        # tight ±250 Hz
+    env = np.abs(xf).astype(np.float32)
+    k = max(1, int(aud * 0.008))
+    return np.convolve(env, np.ones(k, np.float32) / k, mode="same"), aud
 
 # IQ ring buffer: the reader writes here fast; the decoder snapshots a long
 # coherent window off-thread so a slow decode never stalls the SDR read
@@ -147,10 +164,16 @@ def _spectrum(iq):
 
 
 def decode_cw(iq):
-    # NARROW search: decode the signal you TUNED to (near center), not a distant
-    # strong FT8/data carrier that a wide ±50 kHz search would lock instead.
-    off = cw.find_offset(iq, FS, search=4000)
-    env, aud = cw.envelope(iq, FS, off)
+    if STATE["chlock"]:
+        # LOCKED: pinned to one station — no re-hunt, tight ±250 Hz filter,
+        # so we follow that single QSO cleanly even as neighbors come and go.
+        off = STATE["lock_off"]
+        env, aud = envelope_locked(iq, off)
+    else:
+        # NARROW search: decode the signal you TUNED to (near center), not a
+        # distant strong FT8/data carrier a wide search would grab instead.
+        off = cw.find_offset(iq, FS, search=4000)
+        env, aud = cw.envelope(iq, FS, off)
     txt, info = cw.decode_env(env, aud)
     chars = [c for c in txt if c != " "]
     q = round(sum(1 for c in chars if c != "?") / len(chars), 3) if chars else 0.0
@@ -257,7 +280,8 @@ class SDRWorker(threading.Thread):
     def _audio(self, iq):
         """Continuous-phase BFO -> narrow LP -> decimate -> int16 CW audio."""
         n = np.arange(len(iq), dtype=np.float64)
-        mixf = BFO_HZ - self.cw_off            # bring carrier to BFO pitch
+        off = STATE["lock_off"] if STATE["chlock"] else STATE["cw_off"]
+        mixf = BFO_HZ - off                    # bring carrier to BFO pitch
         nco = np.exp(1j * (2 * np.pi * mixf / FS * n + self.aud_phase)).astype(np.complex64)
         self.aud_phase = (self.aud_phase + 2 * np.pi * mixf / FS * len(iq)) % (2 * np.pi)
         xr = (iq * nco).real.astype(np.float32)
@@ -304,11 +328,12 @@ class SDRWorker(threading.Thread):
                     SPEC["db"] = db.tolist(); SPEC["peak_db"] = float(db.max())
                     SPEC["noise_db"] = float(np.percentile(db, 25)); SPEC["ts"] = time.time()
             if STATE["mode"] == "CW":
-                if time.time() - last_off > 1.5:    # track carrier for the audio BFO
+                # track the carrier for the BFO — but NOT while locked (stay put)
+                if not STATE["chlock"] and time.time() - last_off > 1.5:
                     last_off = time.time()
                     snap = ring_snapshot(1.0)
                     if snap is not None:
-                        try: self.cw_off = cw.find_offset(snap, FS, 4000)
+                        try: STATE["cw_off"] = cw.find_offset(snap, FS, 4000)
                         except Exception: pass
                 self._audio(iq)
             if radio_lock:
@@ -387,15 +412,18 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/state":
             with _lock:
                 self._send(json.dumps({**{k: STATE[k] for k in
-                    ("center_khz", "band", "mode", "ifgr", "running", "lock", "err")},
+                    ("center_khz", "band", "mode", "ifgr", "running", "lock", "err", "chlock")},
                     "decode": dict(DECODE), "bands": BANDS, "modes": MODES,
                     "transcript": list(TRANSCRIPT)[-14:],
                     "smeter": round(max(0, (SPEC["peak_db"] - SPEC["noise_db"])), 1)}))
         elif u.path == "/set":
             if "band" in q and q["band"][0] in BANDS:
                 STATE["band"] = q["band"][0]; STATE["center_khz"] = float(BANDS[q["band"][0]])
+                STATE["chlock"] = False              # changing channel releases the lock
             if "center" in q:
-                try: STATE["center_khz"] = round(float(q["center"][0]), 2)
+                try:
+                    STATE["center_khz"] = round(float(q["center"][0]), 2)
+                    STATE["chlock"] = False
                 except ValueError: pass
             if "mode" in q and q["mode"][0] in MODES:
                 STATE["mode"] = q["mode"][0]
@@ -406,11 +434,19 @@ class H(BaseHTTPRequestHandler):
             sigs = detect_signals()          # strongest CW carrier in-band (not FT8)
             if sigs:
                 STATE["center_khz"] = max(sigs, key=lambda s: s["snr"])["khz"]
+                STATE["chlock"] = False
             self._send(json.dumps({"ok": True, "center": STATE["center_khz"]}))
         elif u.path == "/signals":
             self._send(json.dumps({"signals": detect_signals(), "center": STATE["center_khz"]}))
         elif u.path == "/log":
             self._send(json.dumps(log_summary()))
+        elif u.path == "/lock":
+            if q.get("on", ["1"])[0] == "1":
+                STATE["lock_off"] = STATE["cw_off"]   # pin the carrier we're on
+                STATE["chlock"] = True
+            else:
+                STATE["chlock"] = False
+            self._send(json.dumps({"ok": True, "chlock": STATE["chlock"]}))
         elif u.path == "/step":
             d = q.get("d", ["1"])[0]
             freqs = sorted(s["khz"] for s in detect_signals())
@@ -420,6 +456,7 @@ class H(BaseHTTPRequestHandler):
                     STATE["center_khz"] = next((f for f in freqs if f > c + 0.25), freqs[0])
                 else:
                     STATE["center_khz"] = next((f for f in reversed(freqs) if f < c - 0.25), freqs[-1])
+                STATE["chlock"] = False
             self._send(json.dumps({"ok": True, "center": STATE["center_khz"]}))
         elif u.path == "/cw_audio.wav":
             self._stream_audio()
@@ -482,6 +519,7 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .stat{display:flex;justify-content:space-between;font-size:12px;color:var(--mut);padding:2px 0}.stat b{color:var(--ink)}
 .autob{background:var(--acc);color:#04110e;font-weight:700;width:100%;padding:10px;font-size:13px}
 .listen{width:100%;padding:9px;font-size:13px;font-weight:700}.listen.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
+.lockb{width:100%;padding:9px;font-size:13px;font-weight:700}.lockb.on{background:var(--warn);color:#1a1204;border-color:var(--warn)}
 .siglist{background:#000;border:1px solid var(--hair);border-radius:8px;max-height:150px;overflow-y:auto}
 .sig{display:flex;align-items:center;gap:8px;padding:5px 9px;font-size:12px;cursor:pointer;border-bottom:1px solid #0b141c}
 .sig:last-child{border-bottom:none}.sig:hover{background:#0b141c}.sig.on{background:rgba(46,230,200,.12);color:var(--acc)}
@@ -511,6 +549,7 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
     <div><div class=lbl>Band</div><div class=row id=bands></div></div>
     <div><div class=lbl>Mode</div><div class=row id=modes></div></div>
     <button class=autob onclick=autotune()>&#9673; AUTO-TUNE (strongest CW)</button>
+    <button class=lockb id=lockb onclick=togLock()>&#128275; LOCK channel</button>
     <div>
       <div class=lbl style="display:flex;justify-content:space-between;align-items:center">
         <span>CW signals on air</span>
@@ -551,6 +590,9 @@ async function refresh(){
   $('freq').innerHTML=ST.center_khz.toFixed(2)+'<small> kHz</small>';
   $('bandlbl').textContent=ST.band+' · '+ST.mode;
   const lk=$('lock');lk.textContent=ST.lock;lk.className='chip '+ST.lock;
+  $('lockb').classList.toggle('on',ST.chlock);
+  $('lockb').innerHTML=ST.chlock?'&#128274; LOCKED — following QSO':'&#128275; LOCK channel';
+  $('freq').style.color=ST.chlock?'#f0b23a':'#fff';
   if(!$('bands').dataset.f){$('bands').dataset.f=1;
     for(const b in ST.bands){const e=document.createElement('button');e.textContent=b;e.onclick=()=>set('band='+b);e.dataset.b=b;$('bands').appendChild(e);}
     ST.modes.forEach(m=>{const e=document.createElement('button');e.className='mode';e.textContent=m;e.onclick=()=>set('mode='+m);e.dataset.m=m;$('modes').appendChild(e);});}
@@ -577,6 +619,7 @@ async function pollLog(){let s;try{s=await api('/log');}catch(e){return;}
 async function set(kv){await api('/set?'+kv);refresh();}
 async function autotune(){await api('/autotune');refresh();}
 async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
+async function togLock(){await api('/lock?on='+(ST.chlock?0:1));refresh();}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
   list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-c)<0.3;
