@@ -73,24 +73,9 @@ def _gap_boundaries(off_runs, dit):
     return lb, wb
 
 
-def decode_env(env, aud):
-    """Adaptive on/off -> run lengths -> self-calibrated Morse."""
-    hi, lo = np.percentile(env, 90), np.percentile(env, 25)
-    if hi - lo < 1e-6:
-        return "", {}
-    thr = lo + 0.4 * (hi - lo)
-    on = env > thr
-    # run-length encode
-    runs = []
-    cur = on[0]
-    ln = 1
-    for v in on[1:]:
-        if v == cur:
-            ln += 1
-        else:
-            runs.append((cur, ln))
-            cur, ln = v, 1
-    runs.append((cur, ln))
+def _runs_to_text(runs, aud):
+    """Shared back end: run-length list -> self-calibrated Morse text + info.
+    Used by both the classic threshold decoder and the matched-filter decoder."""
     on_runs = [ln for s, ln in runs if s]
     if len(on_runs) < 3:
         return "", {"runs": len(runs)}
@@ -121,6 +106,134 @@ def decode_env(env, aud):
     return "".join(text).strip(), {"dit_ms": round(1000 * dit / aud, 1),
                                    "wpm": round(1.2 / (dit / aud), 1),
                                    "elements": len(on_runs)}
+
+
+def _rle(on):
+    runs = []
+    cur = bool(on[0]); ln = 1
+    for v in on[1:]:
+        if bool(v) == cur:
+            ln += 1
+        else:
+            runs.append((cur, ln)); cur, ln = bool(v), 1
+    runs.append((cur, ln))
+    return runs
+
+
+def decode_env(env, aud):
+    """Adaptive on/off -> run lengths -> self-calibrated Morse (classic path)."""
+    hi, lo = np.percentile(env, 90), np.percentile(env, 25)
+    if hi - lo < 1e-6:
+        return "", {}
+    thr = lo + 0.4 * (hi - lo)
+    return _runs_to_text(_rle(env > thr), aud)
+
+
+def decode_env_mf(env, aud):
+    """Matched-filter + fade-tracking decoder (the 'superior math' path).
+
+    Two research-backed wins over the classic global threshold:
+      1. MATCHED FILTER - a boxcar of one dit is the SNR-optimal detector for a
+         rectangular OOK element in AWGN (RSCW/fldigi). It integrates each element
+         and suppresses noise before slicing.
+      2. FADE-TRACKING THRESHOLD - instead of ONE threshold for the whole capture
+         (which a QSB fade sinks the signal below, mid-character), the slice level
+         rides the signal up and down in ~0.6 s blocks, with hysteresis to stop
+         edge chatter. This is what copies through the 'loud but eye closed'
+         fading that breaks the classic decoder.
+    Falls back to the classic result if it can't get a coarse dit estimate."""
+    if len(env) < aud // 2:
+        return decode_env(env, aud)
+    # coarse dit from a quick global threshold, to size the matched filter
+    hi, lo = np.percentile(env, 90), np.percentile(env, 25)
+    if hi - lo < 1e-6:
+        return "", {}
+    on0 = env > (lo + 0.4 * (hi - lo))
+    on0_runs = [ln for s, ln in _rle(on0) if s]
+    if len(on0_runs) < 3:
+        return "", {"runs": len(on0_runs)}
+    o = np.array(on0_runs, float)
+    dit = np.median(o[o <= np.median(o)]) or np.median(o)
+    ndit = int(np.clip(dit, aud * 0.015, aud * 0.3))           # matched-filter width
+    # 1) matched filter: integrate-and-dump over one dit (boxcar)
+    mf = np.convolve(env, np.ones(ndit, np.float32) / ndit, mode="same")
+    # 2) fade-tracking threshold: per-block on/off levels, interpolated per-sample
+    blk = max(int(0.6 * aud), 4 * ndit)
+    gfloor = np.percentile(mf, 60)                              # global 'is there signal' floor
+    centers, levels, margins = [], [], []
+    for b in range(0, len(mf), blk):
+        seg = mf[b:b + blk]
+        if len(seg) < ndit:
+            continue
+        blo, bhi = np.percentile(seg, 25), np.percentile(seg, 92)
+        centers.append(b + len(seg) / 2)
+        # per-block SNR gate: if the local eye is closed (bhi barely above blo)
+        # or the block is all noise (bhi below the global signal floor), force the
+        # threshold sky-high so noise-only regions emit NO elements (kills the
+        # 'IN T'/'?EHI?E' artifacts the naive tracker slices out of noise).
+        if bhi < gfloor or bhi < 1.6 * blo:
+            levels.append(bhi * 5 + 1e-6); margins.append(0.0)
+        else:
+            levels.append(blo + 0.5 * (bhi - blo)); margins.append(0.5 * (bhi - blo))
+    if len(centers) < 2:
+        return _runs_to_text(_rle(mf > (lo + 0.4 * (hi - lo))), aud)
+    thr = np.interp(np.arange(len(mf)), centers, levels)
+    marg = np.interp(np.arange(len(mf)), centers, margins)
+    # 3) hysteresis (Schmitt) around the tracking threshold
+    hi_t = thr + 0.20 * marg
+    lo_t = thr - 0.20 * marg
+    on = np.empty(len(mf), bool)
+    state = mf[0] > thr[0]
+    for i in range(len(mf)):
+        if state and mf[i] < lo_t[i]:
+            state = False
+        elif not state and mf[i] > hi_t[i]:
+            state = True
+        on[i] = state
+    txt, info = _runs_to_text(_rle(on), aud)
+    info["mf"] = True
+    return txt, info
+
+
+def _eye_and_fade(env):
+    """Cheap eye-opening Q + fade depth (dB) straight from the envelope, so the
+    router can pick a decoder without the full cw_quality apparatus."""
+    e = env[env > 0].astype(np.float64)
+    if len(e) < 200:
+        return 0.0, 0.0
+    thr = np.percentile(e, 55)
+    on, off = e[e > thr], e[e <= thr]
+    if len(on) < 20 or len(off) < 20:
+        return 0.0, 0.0
+    Q = (on.mean() - off.mean()) / (on.std() + off.std() + 1e-9)
+    # fade depth from per-ON-run mark levels
+    runs = _rle(env > thr)
+    idx = 0; marks = []
+    for s, ln in runs:
+        if s and ln > 2:
+            marks.append(float(np.median(env[idx:idx + ln])))
+        idx += ln
+    fade = 0.0
+    if len(marks) >= 6:
+        m = np.array(marks)
+        fade = 20 * np.log10((np.percentile(m, 90) + 1e-9) / (np.percentile(m, 10) + 1e-9))
+    return float(Q), float(fade)
+
+
+def decode_env_auto(env, aud):
+    """Apparatus-routed decode: use the classic threshold decoder when the eye is
+    open (it's proven best on clean signals), and switch to the matched-filter +
+    fade-tracking decoder only when the signal is FADING with a closing eye -
+    exactly the 'loud but eye closed' case where the global threshold fails.
+    Best-of-both with no regression on clean copy."""
+    Q, fade = _eye_and_fade(env)
+    if Q < 3.5 and fade > 6.0:              # fading + eye closing -> matched filter
+        txt, info = decode_env_mf(env, aud)
+        info["route"] = "mf"
+        return txt, info
+    txt, info = decode_env(env, aud)
+    info["route"] = "classic"
+    return txt, info
 
 
 def find_offset(iq, fs, search=15000):

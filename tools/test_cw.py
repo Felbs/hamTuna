@@ -86,10 +86,14 @@ def main():
             bq = b.get("q_ratio", 0.0)
             # regression = quality dropped meaningfully below the baseline
             reg = bq > 0 and q < bq - Q_TOLERANCE
+            # the apparatus-routed decoder must never do WORSE than classic
+            auto_txt = cw.decode_env_auto(env, a)[0]
+            aq = qof(auto_txt)
+            route_reg = aq < q - Q_TOLERANCE
             # also: did we keep the callsign we knew was there?
-            print(f"  {name[:34]:34} q={q:.2f} (base {bq:.2f})  "
-                  f"{'REGRESSION' if reg else 'ok'}  {txt[:34]!r}")
-            fails += 1 if reg else 0
+            print(f"  {name[:30]:30} q={q:.2f} (base {bq:.2f}) auto={aq:.2f}  "
+                  f"{'REGRESSION' if reg else ('ROUTE-REG' if route_reg else 'ok')}  {txt[:28]!r}")
+            fails += 1 if (reg or route_reg) else 0
 
     print("\n" + "=" * 62)
     print(f"RESULT: {'ALL PASS' if fails == 0 else f'{fails} REGRESSION(S)'}")

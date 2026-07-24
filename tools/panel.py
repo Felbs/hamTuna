@@ -32,6 +32,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
 import cw
+import cw_quality
 import hamdb
 try:
     import radio_lock
@@ -99,7 +100,8 @@ def cur_off_hz():
     return (STATE["tune_khz"] - STATE["center_khz"]) * 1000.0
 SPEC = {"db": [0.0] * DISP_BINS, "peak_db": -120.0, "noise_db": -120.0, "ts": 0.0}
 DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
-          "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0}
+          "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
+          "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
 TRANSCRIPT = deque(maxlen=60)
 AUDIO = deque(maxlen=AUD_FS * 4)
 SIGLIST = {"band": None, "sigs": []}   # classifier's authoritative carrier list: [{khz,snr,cw,wpm}]
@@ -183,19 +185,32 @@ def decode_cw(iq):
     if not STATE["chlock"]:
         STATE["last_off"] = off
     env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
-    txt, info = cw.decode_env(env, aud)
+    txt, info = cw.decode_env_auto(env, aud)          # apparatus-routed decoder
     chars = [c for c in txt if c != " "]
     q = round(sum(1 for c in chars if c != "?") / len(chars), 3) if chars else 0.0
     wpm = info.get("wpm", 0.0)
     ok = 3 <= wpm <= 45 and txt.strip()
     conf = round(q * min(1.0, len(chars) / 10), 3) if ok else 0.0
-    if not ok:
-        hint = "no readable CW — click a signal on the waterfall or Auto-Tune"
-    elif q < 0.7:
-        hint = f"weak/noisy signal — only {int(q * 100)}% clean; pick a stronger one from the list"
+    # HONEST quality: eye-opening Q (measured pre-decode, can't be faked by a
+    # confident-but-wrong decode the way q_ratio can) + a plain verdict.
+    eye_q, eye_db, copy_pct, _, _, _ = cw_quality.eye_opening(env)
+    if eye_q >= cw_quality.Q_SOLID:
+        verdict = "SOLID"
+    elif eye_q >= cw_quality.Q_READABLE:
+        verdict = "READABLE"
+    else:
+        verdict = "FAILING"
+    if eye_q < cw_quality.Q_READABLE:
+        hint = ("eye is CLOSED — signal is fading/smeared, not just weak; "
+                "the ✓CW list shows which carriers are actually copyable")
+    elif not ok:
+        hint = "no readable CW — click a ✓CW signal on the list or Auto-Tune"
     else:
         hint = ""
     return {"text": txt if ok else "", "wpm": wpm, "q": q, "conf": conf,
+            "eye_q": round(eye_q, 2), "eye_db": round(eye_db, 1),
+            "copy_pct": round(copy_pct), "verdict": verdict,
+            "route": info.get("route", "classic"),
             "elements": info.get("elements", 0), "offset_hz": round(off, 1), "hint": hint}
 
 
@@ -447,20 +462,26 @@ class Classifier(threading.Thread):
             out = []
             for s in detect_signals():
                 co = (s["khz"] - STATE["center_khz"]) * 1000.0
-                cw_ok, wpm = False, 0
+                cw_ok, wpm, eye = False, 0, 0.0
                 try:
                     ss = iq[:int(FS)]
                     n = np.arange(len(ss))
                     x = (ss * np.exp(-2j * np.pi * co / FS * n)).astype(np.complex64)
                     off = co + cw.find_offset(x, FS, 400)
                     env, aud = envelope_locked(iq, off)
-                    txt, info = cw.decode_env(env, aud)
+                    txt, info = cw.decode_env_auto(env, aud)
                     w = info.get("wpm", 0)
-                    cw_ok = bool(3 <= w <= 45 and len([c for c in txt if c != " "]) >= 4)
+                    eye = cw_quality.eye_opening(env)[0]
+                    # copyable = a real CW eye is OPEN (Q>=readable) AND the keying
+                    # rate is sane. Eye-based tag catches copyable CW even when the
+                    # text decode is partial, and rejects data carriers (no CW eye).
+                    cw_ok = bool(eye >= cw_quality.Q_READABLE and 3 <= w <= 45
+                                 and len([c for c in txt if c != " "]) >= 3)
                     wpm = round(float(w), 1) if cw_ok else 0
                 except Exception:
                     pass
-                out.append({"khz": s["khz"], "snr": s["snr"], "cw": cw_ok, "wpm": wpm})
+                out.append({"khz": s["khz"], "snr": s["snr"], "cw": cw_ok,
+                            "wpm": wpm, "eye": round(float(eye), 1)})
             # the classifier is the signal-list authority: detect + decode in ONE
             # pass, so tags always match their carrier (no cross-snapshot mismatch)
             with _lock:
@@ -666,10 +687,13 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
     <button class=listen id=listenb onclick=togListen()>&#9654; LISTEN (live audio)</button>
     <audio id=au></audio>
     <div class=dial>
-      <div class=lbl>Truth Dial &mdash; decode confidence</div>
-      <div class=big id=conf>0%</div><div class=gauge><div class=gfill id=confbar style=width:0%></div></div>
+      <div class=lbl>Copy Quality &mdash; eye-opening (the CW "MER")</div>
+      <div class=big><span id=verdict>&mdash;</span> <small id=copypct class=sub></small></div>
+      <div class=gauge><div class=gfill id=eyebar style=width:0%></div></div>
+      <div class=stat><span>eye-opening Q</span><b id=eye>&mdash;</b></div>
       <div class=stat><span>WPM</span><b id=wpm>&mdash;</b></div>
-      <div class=stat><span>char quality</span><b id=q>&mdash;</b></div>
+      <div class=stat><span>decoder</span><b id=route>&mdash;</b></div>
+      <div class=stat><span>decode confidence</span><b id=conf>0%</b></div>
       <div class=stat><span>S-meter</span><b id=sm>&mdash;</b></div>
       <div class=smeter><div class=sfill id=smbar style=width:0%></div></div>
     </div>
@@ -705,8 +729,15 @@ async function refresh(){
   [...$('bands').children].forEach(e=>e.classList.toggle('on',e.dataset.b===ST.band));
   [...$('modes').children].forEach(e=>e.classList.toggle('on',e.dataset.m===ST.mode));
   const d=ST.decode||{};
-  $('conf').textContent=Math.round((d.conf||0)*100)+'%';$('confbar').style.width=Math.round((d.conf||0)*100)+'%';
-  $('wpm').textContent=d.wpm?d.wpm.toFixed(1):'—';$('q').textContent=d.q?d.q.toFixed(2):'—';
+  const vd=d.verdict||'—', vc={SOLID:'#33ff99',READABLE:'#f0d24a',FAILING:'#ff5a5a'}[vd]||'#8aa';
+  const vel=$('verdict'); vel.textContent=vd; vel.style.color=vc;
+  $('copypct').textContent=(d.copy_pct!=null&&d.wpm)?('~'+d.copy_pct+'% copy'):'';
+  const eq=d.eye_q||0; $('eye').textContent=eq?eq.toFixed(2):'—';
+  $('eyebar').style.width=Math.min(100,Math.max(0,(eq-1.5)/(4.0-1.5)*100))+'%';
+  $('eyebar').style.background=vc;
+  $('conf').textContent=Math.round((d.conf||0)*100)+'%';
+  $('route').textContent=d.route?(d.route==='mf'?'matched-filter (fading)':'classic'):'—';
+  $('wpm').textContent=d.wpm?d.wpm.toFixed(1):'—';
   $('sm').textContent=(ST.smeter||0).toFixed(0)+' dB';$('smbar').style.width=Math.min(100,(ST.smeter||0)*2.2)+'%';
   $('declbl').textContent=ST.mode==='CW'?'Live Morse transcript':ST.mode+' decode';
   const xs=$('xscript');
