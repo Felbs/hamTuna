@@ -102,6 +102,7 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0}
 TRANSCRIPT = deque(maxlen=60)
 AUDIO = deque(maxlen=AUD_FS * 4)
+SIGCLASS = {}          # khz -> {"cw": bool, "wpm": float}: is this carrier copyable CW?
 _lock = threading.Lock()
 _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
@@ -171,17 +172,16 @@ def _spectrum(iq):
 
 
 def decode_cw(iq):
-    if STATE["chlock"]:
-        off = STATE["lock_off"]           # pinned
-    else:
-        co = cur_off_hz()                 # the cursor position
-        # snap to the nearest carrier within ±400 Hz of the cursor (tight enough
-        # not to grab an adjacent station; click-to-peak lands you within a bin).
-        s = iq[:int(FS)] if len(iq) > FS else iq
-        n = np.arange(len(s))
-        x = (s * np.exp(-2j * np.pi * co / FS * n)).astype(np.complex64)
-        off = co + cw.find_offset(x, FS, 400)
-        STATE["last_off"] = off           # remember the real carrier (LOCK pins this)
+    # base = where to look: the locked carrier, or the live cursor. EITHER way
+    # snap ±400 Hz to the actual carrier there (a bin-resolution cursor or a
+    # slightly-off lock is still grabbed), then narrow-filter just that signal.
+    base = STATE["lock_off"] if STATE["chlock"] else cur_off_hz()
+    s = iq[:int(FS)] if len(iq) > FS else iq
+    n = np.arange(len(s))
+    x = (s * np.exp(-2j * np.pi * base / FS * n)).astype(np.complex64)
+    off = base + cw.find_offset(x, FS, 400)
+    if not STATE["chlock"]:
+        STATE["last_off"] = off
     env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
     txt, info = cw.decode_env(env, aud)
     chars = [c for c in txt if c != " "]
@@ -429,6 +429,39 @@ class Verifier(threading.Thread):
                 pass
 
 
+class Classifier(threading.Thread):
+    """Off-thread: probe each detected carrier and tag whether it's actually
+    copyable CW (valid WPM + real text) vs data/QSB/machine-CW — so the signal
+    list tells you what you can READ, not just what's loud."""
+    daemon = True
+
+    def run(self):
+        while True:
+            time.sleep(8)
+            if STATE["mode"] != "CW":
+                continue
+            iq = ring_snapshot(8)
+            if iq is None:
+                continue
+            new = {}
+            for s in detect_signals():
+                co = (s["khz"] - STATE["center_khz"]) * 1000.0
+                try:
+                    ss = iq[:int(FS)]
+                    n = np.arange(len(ss))
+                    x = (ss * np.exp(-2j * np.pi * co / FS * n)).astype(np.complex64)
+                    off = co + cw.find_offset(x, FS, 400)
+                    env, aud = envelope_locked(iq, off)
+                    txt, info = cw.decode_env(env, aud)
+                    wpm = info.get("wpm", 0)
+                    ok = bool(3 <= wpm <= 45 and len([c for c in txt if c != " "]) >= 4)
+                    new[s["khz"]] = {"cw": ok, "wpm": round(float(wpm), 1) if ok else 0}
+                except Exception:
+                    new[s["khz"]] = {"cw": False, "wpm": 0}
+            with _lock:
+                SIGCLASS.clear(); SIGCLASS.update(new)
+
+
 def _wav_header(nbytes=0x7FFFF000):
     return (b"RIFF" + struct.pack("<I", nbytes + 36) + b"WAVEfmt " +
             struct.pack("<IHHIIHH", 16, 1, 1, AUD_FS, AUD_FS * 2, 2, 16) +
@@ -495,13 +528,18 @@ class H(BaseHTTPRequestHandler):
             except (ValueError, KeyError): pass
             self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"]}))
         elif u.path == "/signals":
-            self._send(json.dumps({"signals": detect_signals(),
+            sigs = detect_signals()
+            with _lock:
+                for s in sigs:
+                    cls = SIGCLASS.get(s["khz"]) or {}
+                    s["cw"] = cls.get("cw", None); s["wpm"] = cls.get("wpm", 0)
+            self._send(json.dumps({"signals": sigs,
                                    "center": STATE["center_khz"], "tune": STATE["tune_khz"]}))
         elif u.path == "/log":
             self._send(json.dumps(log_summary()))
         elif u.path == "/lock":
             if q.get("on", ["1"])[0] == "1":
-                STATE["lock_off"] = STATE.get("last_off") or cur_off_hz()  # pin the real carrier
+                STATE["lock_off"] = cur_off_hz()      # pin the cursor; decode snaps ±400 to its carrier
                 STATE["chlock"] = True
             else:
                 STATE["chlock"] = False
@@ -549,6 +587,7 @@ def main():
     SDRWorker().start()
     Decoder().start()
     Verifier().start()
+    Classifier().start()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 
 
@@ -584,6 +623,7 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .sig:last-child{border-bottom:none}.sig:hover{background:#0b141c}.sig.on{background:rgba(46,230,200,.12);color:var(--acc)}
 .sig .bar{flex:1;height:5px;background:#08120f;border-radius:3px;overflow:hidden}.sig .bar span{display:block;height:100%;background:var(--acc)}
 .sig .snr{color:var(--mut);font-size:10px;width:40px;text-align:right}
+.sig.dim{opacity:.5}.cwtag{font-size:9px;color:var(--good);font-weight:700;white-space:nowrap}.cwtag.off{color:var(--mut);font-weight:400}
 button.step{padding:2px 9px;font-size:13px;font-weight:700}
 .logbook{background:#060d13;border:1px solid var(--hair);border-radius:10px;padding:12px}
 .score{font-size:28px;font-weight:700;color:var(--good);text-shadow:0 0 12px rgba(58,209,122,.3)}.score small{font-size:12px;color:var(--mut);margin-left:5px}
@@ -685,7 +725,8 @@ async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
   const cur=s.tune!==undefined?s.tune:c;
   list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-cur)<0.3;
-    return `<div class="sig${on?' on':''}" onclick="tune(${x.khz})"><span>${x.khz.toFixed(2)}</span><span class=bar><span style="width:${Math.min(100,x.snr*3)}%"></span></span><span class=snr>${x.snr}dB</span></div>`;}).join(''):'<div class=sub style="padding:8px">no CW carriers here — try another band</div>';}
+    const tag=x.cw===true?`<span class=cwtag>&check;CW ${x.wpm}</span>`:(x.cw===false?'<span class="cwtag off">data/busy</span>':'<span class="cwtag off">…</span>');
+    return `<div class="sig${on?' on':''}${x.cw===false?' dim':''}" onclick="tune(${x.khz})"><span>${x.khz.toFixed(2)}</span>${tag}<span class=bar><span style="width:${Math.min(100,x.snr*3)}%"></span></span><span class=snr>${x.snr}dB</span></div>`;}).join(''):'<div class=sub style="padding:8px">no CW carriers here — try another band</div>';}
 // click a canvas -> snap to the local peak near the click (point-and-click nav)
 function snap(e,c){const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
   if(!DB.length||!ST.center_khz)return;
