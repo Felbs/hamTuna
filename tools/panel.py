@@ -879,13 +879,15 @@ function zoomBy(factor,fx){          // fx = 0..1 anchor point across the canvas
   VIEW.c=fk-(fx-0.5)*VIEW.s;clampView();   // hold that freq under the anchor
   wfDirty=true;}                     // rebuild the waterfall at the new scale
 function onWheel(e){e.preventDefault();
-  // Lock the TUNING CURSOR to the center of the zoom: it stays put (only a click
-  // moves it), and the band expands/contracts around it.
-  if(VC===null)return;
+  // Zoom PIVOTS on the tuning cursor: the locked signal stays exactly where it is on
+  // screen and the band expands/contracts around it. The cursor only ever moves when
+  // you click a signal, never while zooming.
+  if(VC===null||VS===null)return;
   const tk=(ST.tune_khz!=null?ST.tune_khz:VC);
-  VIEW.s=VS*(e.deltaY>0?1.5:0.66);
-  VIEW.c=tk;                                                 // cursor = zoom center
-  clampView();wfDirty=true;}                                 // scroll UP = zoom IN
+  const fx=(tk-(VC-VS/2))/VS;                    // cursor's current position across the view
+  VIEW.s=Math.max(1,Math.min(FULLSPAN,VS*(e.deltaY>0?1.5:0.66)));
+  VIEW.c=tk-(fx-0.5)*VIEW.s;                     // hold the cursor at that same spot
+  clampView();wfDirty=true;}                     // scroll UP = zoom IN
 // middle-drag pan: "grab" the waterfall and slide it (CSS transform for live feel,
 // then commit the new center on release). mousemove/up on WINDOW so it tracks even
 // when the mouse leaves the canvas.
@@ -978,9 +980,8 @@ function snap(e,c){if(e.button&&e.button!==0)return;if(!DB.length||VC===null)ret
   let i0=Math.floor(fx*DB.length),w=Math.max(4,Math.round(DB.length*0.02)); // ±2% window
   let lo=Math.max(0,i0-w),hi=Math.min(DB.length,i0+w),bi=i0,bv=-1e9;
   for(let i=lo;i<hi;i++)if(DB[i]>bv){bv=DB[i];bi=i;}
-  const f=VC-VS/2+(bi/DB.length)*VS;
-  VIEW.c=f;clampView();wfDirty=true;      // center the view on the clicked signal
-  tune(f.toFixed(2));}
+  const f=VC-VS/2+(bi/DB.length)*VS;      // lock the cursor onto the signal IN PLACE
+  tune(f.toFixed(2));}                    // (no view recenter — zoom pivots on it)
 // Controls: SCROLL = zoom, MIDDLE-DRAG = pan, LEFT-CLICK = snap cursor to signal,
 // DOUBLE-CLICK = reset to full band. (Middle-click autoscroll fully suppressed.)
 for(const c of [spec,wf]){
