@@ -879,14 +879,23 @@ function zoomBy(factor,fx){          // fx = 0..1 anchor point across the canvas
   VIEW.c=fk-(fx-0.5)*VIEW.s;clampView();   // hold that freq under the anchor
   wfDirty=true;}                     // rebuild the waterfall at the new scale
 function onWheel(e){e.preventDefault();
-  const r=e.currentTarget.getBoundingClientRect();
-  zoomBy(e.deltaY>0?1.5:0.66,(e.clientX-r.left)/r.width);}   // scroll UP = zoom IN
-let panning=false,panX=0,panC=0;
-function onPanStart(e){if(e.button!==1)return;e.preventDefault();panning=true;
-  panX=e.clientX;panC=VIEW.c;}
-function onPanMove(e){if(!panning)return;const r=e.currentTarget.getBoundingClientRect();
-  const dkhz=(e.clientX-panX)/r.width*VIEW.s;VIEW.c=panC-dkhz;clampView();wfDirty=true;}
-function onPanEnd(){panning=false;}
+  // PIVOT the zoom on the TUNING CURSOR (the signal you're centered on stays fixed)
+  const tk=(ST.tune_khz||VC);
+  const fx=VS?Math.max(0,Math.min(1,(tk-(VC-VS/2))/VS)):0.5;
+  zoomBy(e.deltaY>0?1.5:0.66,fx);}                           // scroll UP = zoom IN
+// middle-drag pan: "grab" the waterfall and slide it (CSS transform for live feel,
+// then commit the new center on release). mousemove/up on WINDOW so it tracks even
+// when the mouse leaves the canvas.
+let panning=false,panStartX=0,panDx=0;
+function onPanStart(e){if(e.button!==1)return;e.preventDefault();
+  panning=true;panStartX=e.clientX;panDx=0;document.body.style.userSelect='none';}
+function onPanMove(e){if(!panning)return;
+  panDx=e.clientX-panStartX;const tx='translateX('+panDx+'px)';
+  spec.style.transform=tx;wf.style.transform=tx;$('curline').style.transform=tx;}
+function onPanEnd(){if(!panning)return;panning=false;document.body.style.userSelect='';
+  spec.style.transform='';wf.style.transform='';$('curline').style.transform='';
+  if(panDx&&VS&&spec.width){VIEW.c=VC-panDx/spec.width*VS;clampView();wfDirty=true;}
+  panDx=0;}
 let lastCenter=null;
 async function refresh(){
   ST=await api('/state');
@@ -972,12 +981,12 @@ function snap(e,c){if(e.button&&e.button!==0)return;if(!DB.length||VC===null)ret
 for(const c of [spec,wf]){
   c.addEventListener('wheel',onWheel,{passive:false});
   c.addEventListener('mousedown',e=>{if(e.button===1){e.preventDefault();onPanStart(e);}});
-  c.addEventListener('mousemove',onPanMove);
   c.addEventListener('click',e=>{if(!e.button)snap(e,c);});
   c.addEventListener('dblclick',e=>{e.preventDefault();viewReset();});
   c.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});   // kill autoscroll
   c.addEventListener('contextmenu',e=>e.preventDefault());
 }
+addEventListener('mousemove',onPanMove);   // on WINDOW so the drag tracks off-canvas
 addEventListener('mouseup',onPanEnd);
 let listening=false;
 function togListen(){const a=$('au');listening=!listening;$('listenb').classList.toggle('on',listening);
