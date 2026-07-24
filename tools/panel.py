@@ -174,6 +174,25 @@ def _spectrum(iq):
     return db[:step * DISP_BINS].reshape(DISP_BINS, step).max(1).astype(np.float32)
 
 
+_AI = "unset"          # lazy-loaded neural decoder: (model, torch) | None
+
+
+def _get_ai():
+    """Load the trained CNN-BiLSTM-CTC model once. Returns (model, torch) or None
+    if torch/model unavailable - so the panel runs fine without the AI."""
+    global _AI
+    if _AI == "unset":
+        try:
+            import cw_ai
+            if cw_ai.MODEL_PATH.exists():
+                _AI = cw_ai.load_model()          # (model, torch)
+            else:
+                _AI = None
+        except Exception:
+            _AI = None
+    return _AI
+
+
 def decode_cw(iq):
     # base = where to look: the locked carrier, or the live cursor. EITHER way
     # snap ±400 Hz to the actual carrier there (a bin-resolution cursor or a
@@ -186,7 +205,21 @@ def decode_cw(iq):
     if not STATE["chlock"]:
         STATE["last_off"] = off
     env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
-    txt, info = cw.decode_env_auto(env, aud)          # apparatus-routed decoder
+    # NEURAL decoder first (trained CNN-BiLSTM-CTC, reads real callsigns); falls
+    # back to the apparatus-routed classic/matched-filter decoder if it's absent
+    # or produces nothing.
+    txt, info = cw.decode_env_auto(env, aud)
+    route = info.get("route", "classic")
+    ai = _get_ai()
+    if ai is not None:
+        try:
+            import cw_ai
+            wenv, waud = cw.envelope(iq, FS, off)         # match the AI's training pipeline
+            ai_txt = cw_ai.decode_feat(ai[0], cw_ai.env_to_feat(wenv, waud), ai[1])
+            if ai_txt and len([c for c in ai_txt if c != " "]) >= 3:
+                txt, route = ai_txt, "neural"
+        except Exception:
+            pass
     txt = cw_lm.rescore(txt)                          # ham LM: re-segment words + repair '?'
     chars = [c for c in txt if c != " "]
     q = round(sum(1 for c in chars if c != "?") / len(chars), 3) if chars else 0.0
@@ -212,7 +245,7 @@ def decode_cw(iq):
     return {"text": txt if ok else "", "wpm": wpm, "q": q, "conf": conf,
             "eye_q": round(eye_q, 2), "eye_db": round(eye_db, 1),
             "copy_pct": round(copy_pct), "verdict": verdict,
-            "route": info.get("route", "classic"),
+            "route": route,
             "elements": info.get("elements", 0), "offset_hz": round(off, 1), "hint": hint}
 
 
@@ -746,7 +779,7 @@ async function refresh(){
   $('eyebar').style.width=Math.min(100,Math.max(0,(eq-1.5)/(4.0-1.5)*100))+'%';
   $('eyebar').style.background=vc;
   $('conf').textContent=Math.round((d.conf||0)*100)+'%';
-  $('route').textContent=d.route?(d.route==='mf'?'matched-filter (fading)':'classic'):'—';
+  $('route').textContent=d.route?({neural:'🧠 neural AI',mf:'matched-filter (fading)',classic:'classic'}[d.route]||d.route):'—';
   $('wpm').textContent=d.wpm?d.wpm.toFixed(1):'—';
   $('sm').textContent=(ST.smeter||0).toFixed(0)+' dB';$('smbar').style.width=Math.min(100,(ST.smeter||0)*2.2)+'%';
   $('declbl').textContent=ST.mode==='CW'?'Live Morse transcript':ST.mode+' decode';

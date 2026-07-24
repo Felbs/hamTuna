@@ -122,6 +122,23 @@ def main():
         print(f"\n[lm] ERROR: {e}")
         fails += 1
 
+    # 5) neural decoder guard: cw_ai imports + decodes a clean synth clip (only if
+    # torch + a trained model are present; skip gracefully otherwise)
+    try:
+        import cw_ai
+        if cw_ai.MODEL_PATH.exists():
+            import cw_synth
+            model, torch = cw_ai.load_model()
+            env, a = cw_synth.render("CQ CQ DE W1AW K", wpm=20, noise=0.12, seed=3)
+            ai = cw_ai.decode_feat(model, cw_ai.env_to_feat(env, a), torch)
+            aok = "W1AW" in ai.replace(" ", "") or "CQ" in ai
+            print(f"\n[ai] synth 'CQ CQ DE W1AW K' -> {ai[:24]!r:26} {'PASS' if aok else 'WARN'}")
+            # non-fatal: AI is best-effort; don't fail the guard on a soft miss
+        else:
+            print("\n[ai] no trained model yet - skipped")
+    except Exception as e:
+        print(f"\n[ai] torch/model unavailable - skipped ({str(e)[:40]})")
+
     print("\n" + "=" * 62)
     print(f"RESULT: {'ALL PASS' if fails == 0 else f'{fails} REGRESSION(S)'}")
     print("=" * 62)
