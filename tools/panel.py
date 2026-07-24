@@ -102,7 +102,7 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0}
 TRANSCRIPT = deque(maxlen=60)
 AUDIO = deque(maxlen=AUD_FS * 4)
-SIGCLASS = {}          # khz -> {"cw": bool, "wpm": float}: is this carrier copyable CW?
+SIGLIST = {"band": None, "sigs": []}   # classifier's authoritative carrier list: [{khz,snr,cw,wpm}]
 _lock = threading.Lock()
 _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
@@ -443,9 +443,11 @@ class Classifier(threading.Thread):
             iq = ring_snapshot(8)
             if iq is None:
                 continue
-            new = {}
+            band = STATE["band"]
+            out = []
             for s in detect_signals():
                 co = (s["khz"] - STATE["center_khz"]) * 1000.0
+                cw_ok, wpm = False, 0
                 try:
                     ss = iq[:int(FS)]
                     n = np.arange(len(ss))
@@ -453,13 +455,16 @@ class Classifier(threading.Thread):
                     off = co + cw.find_offset(x, FS, 400)
                     env, aud = envelope_locked(iq, off)
                     txt, info = cw.decode_env(env, aud)
-                    wpm = info.get("wpm", 0)
-                    ok = bool(3 <= wpm <= 45 and len([c for c in txt if c != " "]) >= 4)
-                    new[s["khz"]] = {"cw": ok, "wpm": round(float(wpm), 1) if ok else 0}
+                    w = info.get("wpm", 0)
+                    cw_ok = bool(3 <= w <= 45 and len([c for c in txt if c != " "]) >= 4)
+                    wpm = round(float(w), 1) if cw_ok else 0
                 except Exception:
-                    new[s["khz"]] = {"cw": False, "wpm": 0}
+                    pass
+                out.append({"khz": s["khz"], "snr": s["snr"], "cw": cw_ok, "wpm": wpm})
+            # the classifier is the signal-list authority: detect + decode in ONE
+            # pass, so tags always match their carrier (no cross-snapshot mismatch)
             with _lock:
-                SIGCLASS.clear(); SIGCLASS.update(new)
+                SIGLIST["band"] = band; SIGLIST["sigs"] = out
 
 
 def _wav_header(nbytes=0x7FFFF000):
@@ -528,11 +533,13 @@ class H(BaseHTTPRequestHandler):
             except (ValueError, KeyError): pass
             self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"]}))
         elif u.path == "/signals":
-            sigs = detect_signals()
             with _lock:
+                fresh = SIGLIST["band"] == STATE["band"] and SIGLIST["sigs"]
+                sigs = [dict(s) for s in SIGLIST["sigs"]] if fresh else None
+            if sigs is None:            # band just changed: show carriers now, tags fill in <=8s
+                sigs = detect_signals()
                 for s in sigs:
-                    cls = SIGCLASS.get(s["khz"]) or {}
-                    s["cw"] = cls.get("cw", None); s["wpm"] = cls.get("wpm", 0)
+                    s["cw"] = None; s["wpm"] = 0
             self._send(json.dumps({"signals": sigs,
                                    "center": STATE["center_khz"], "tune": STATE["tune_khz"]}))
         elif u.path == "/log":
