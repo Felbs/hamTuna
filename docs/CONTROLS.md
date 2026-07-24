@@ -62,7 +62,25 @@ flowchart TD
   spec --> draw
 ```
 
+## The control contract (how the user wants it — don't regress)
+
+| input | action |
+|-------|--------|
+| **left click / drag** | grab & move the tuning line EXACTLY under the pointer (the mouse is the target). Only this + Auto-Tune/Scan/signal-click ever move `tune_khz`. |
+| **middle click + drag** | slide the waterfall left/right through the band **live** (real-time). |
+| **scroll wheel** | zoom in/out, **pivoting on the tuning cursor** (cursor stays put, band expands/contracts around it). |
+| **double-click** | reset to full band. |
+| **⊙ button** | recenter view on the cursor (find it). **⤢** full band. **+/−** zoom. |
+| **AUTO-TUNE** | best copyable CW on the CURRENT band. |
+| **SCAN ALL BANDS** | live hop every CW band, tune to the best (guarded, gentle dwell). |
+
 **Invariants — do not break:**
+- The cursor moves ONLY on click/drag/auto — never while zooming or panning.
+- **Never retune the SDR rapidly** — the RSPdx firmware wedges on fast successive
+  `setFrequency`. Band-hop scans use a >=2s dwell + a SCANNING guard; the reader
+  self-heals a stalled SDR (reopens after ~8s of no data).
+- Every worker thread body is wrapped so a bug can't kill the thread and freeze the
+  server (the decoder-new-callsign crash taught us this).
 - **VIEW (browser) is separate from STATE (backend).** Zoom/pan change only VIEW
   (the visible window); they never retune the SDR. Only band change moves `center_khz`.
 - **`tune_khz` is the one cursor truth** — it drives the cursor line, the decoder
