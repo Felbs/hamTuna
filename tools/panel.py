@@ -907,13 +907,16 @@ let DB=[];
 // waterfall navigation: VIEW = the visible freq window (c=center kHz, s=span kHz).
 // null span = full band. VC/VS = the actual window the last /spectrum returned.
 let VIEW={c:null,s:null}, VC=null, VS=null, FULLSPAN=250, SDRCENTER=null, wfDirty=false;
+let prevVC=null, prevVS=null;   // for real-time horizontal waterfall pan
 function viewInit(center,span){FULLSPAN=span;SDRCENTER=center;
   if(VIEW.c===null){VIEW.c=center;VIEW.s=span;}}
 function viewReset(){if(SDRCENTER!==null){VIEW.c=SDRCENTER;VIEW.s=FULLSPAN;wfDirty=true;}}
 function centerCursor(){if(ST.tune_khz){VIEW.c=ST.tune_khz;clampView();wfDirty=true;}}  // jump back to the cursor
-function clampView(){const half=VIEW.s/2, lo=SDRCENTER-FULLSPAN/2+half, hi=SDRCENTER+FULLSPAN/2-half;
-  VIEW.s=Math.max(1,Math.min(FULLSPAN,VIEW.s));   // 1 kHz deepest zoom
-  if(VIEW.s>=FULLSPAN){VIEW.c=SDRCENTER;}else{VIEW.c=Math.max(lo,Math.min(hi,VIEW.c));}}
+function clampView(){
+  VIEW.s=Math.max(1,Math.min(FULLSPAN,VIEW.s));   // clamp span FIRST (1 kHz deepest zoom)
+  if(VIEW.s>=FULLSPAN*0.985){VIEW.s=FULLSPAN;VIEW.c=SDRCENTER;return;}  // snap to full band so zoom-out always reaches it
+  const half=VIEW.s/2, lo=SDRCENTER-FULLSPAN/2+half, hi=SDRCENTER+FULLSPAN/2-half;
+  VIEW.c=Math.max(lo,Math.min(hi,VIEW.c));}
 function zoomBy(factor,fx){          // fx = 0..1 anchor point across the canvas
   if(SDRCENTER===null||VC===null)return;
   const fk=VC-VS/2+fx*VS;            // freq under the anchor right now
@@ -930,19 +933,16 @@ function onWheel(e){e.preventDefault();
   VIEW.s=Math.max(1,Math.min(FULLSPAN,VS*(e.deltaY>0?1.5:0.66)));
   VIEW.c=tk-(fx-0.5)*VIEW.s;                     // hold the cursor at that same spot
   clampView();wfDirty=true;}                     // scroll UP = zoom IN
-// middle-drag pan: "grab" the waterfall and slide it (CSS transform for live feel,
-// then commit the new center on release). mousemove/up on WINDOW so it tracks even
-// when the mouse leaves the canvas.
-let panning=false,panStartX=0,panDx=0;
+// middle-drag pan: slide the view LIVE (VIEW.c updates every move; the waterfall
+// history shifts horizontally in draw() so it slides in real time). mousemove/up on
+// WINDOW so it tracks even when the mouse leaves the canvas.
+let panning=false,panStartX=0,panStartC=0;
 function onPanStart(e){if(e.button!==1)return;e.preventDefault();
-  panning=true;panStartX=e.clientX;panDx=0;document.body.style.userSelect='none';}
-function onPanMove(e){if(!panning)return;
-  panDx=e.clientX-panStartX;const tx='translateX('+panDx+'px)';
-  spec.style.transform=tx;wf.style.transform=tx;$('curline').style.transform=tx;}
-function onPanEnd(){if(!panning)return;panning=false;document.body.style.userSelect='';
-  spec.style.transform='';wf.style.transform='';$('curline').style.transform='';
-  if(panDx&&VS&&spec.width){VIEW.c=VC-panDx/spec.width*VS;clampView();wfDirty=true;}
-  panDx=0;}
+  panning=true;panStartX=e.clientX;panStartC=VIEW.c;document.body.style.userSelect='none';}
+function onPanMove(e){if(!panning||!VS||!spec.width)return;
+  const dkhz=(e.clientX-panStartX)/spec.width*VS;   // drag right -> lower freqs (grab & pull)
+  VIEW.c=panStartC-dkhz;clampView();}
+function onPanEnd(){if(!panning)return;panning=false;document.body.style.userSelect='';}
 let lastCenter=null;
 async function refresh(){
   ST=await api('/state');
@@ -1064,8 +1064,14 @@ async function draw(){
   sx.strokeStyle='#2ee6c8';sx.lineWidth=1.4;sx.shadowColor='#2ee6c8';sx.shadowBlur=6;sx.beginPath();
   for(let i=0;i<db.length;i++){const x=i/db.length*w,y=h-(db[i]-lo)/rng*h;i?sx.lineTo(x,y):sx.moveTo(x,y);}sx.stroke();sx.shadowBlur=0;
   const cwd=wf.width,ch=wf.height;
-  if(wfDirty){wx.fillStyle='#000';wx.fillRect(0,0,cwd,ch);wfDirty=false;}  // rebuild at new zoom
-  wx.putImageData(wx.getImageData(0,0,cwd,ch),0,1);
+  if(wfDirty){wx.fillStyle='#000';wx.fillRect(0,0,cwd,ch);wfDirty=false;prevVC=VC;prevVS=VS;}  // rebuild at new zoom
+  // real-time PAN: shift the waterfall history horizontally to stay freq-aligned
+  let shiftPx=0;
+  if(prevVC!==null&&Math.abs(VS-prevVS)<1e-9)shiftPx=Math.round((prevVC-VC)/VS*cwd);
+  prevVC=VC;prevVS=VS;
+  wx.putImageData(wx.getImageData(0,0,cwd,ch),shiftPx,1);   // scroll down 1 + pan horizontally
+  if(shiftPx>0){wx.fillStyle='#000';wx.fillRect(0,0,shiftPx,ch);}          // clear newly-exposed edge
+  else if(shiftPx<0){wx.fillStyle='#000';wx.fillRect(cwd+shiftPx,0,-shiftPx,ch);}
   const row=wx.createImageData(cwd,1);
   for(let x=0;x<cwd;x++){const i=Math.floor(x/cwd*db.length);let v=(db[i]-lo)/rng;const c=oled(v);
     row.data[x*4]=c[0];row.data[x*4+1]=c[1];row.data[x*4+2]=c[2];row.data[x*4+3]=255;}
