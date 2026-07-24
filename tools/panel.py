@@ -186,12 +186,25 @@ def _downsample(db, bins):
 
 
 def _view_slice(hi, center, vc, vs, bins=DISP_BINS):
-    """Slice the high-res spectrum to the view window [vc±vs/2] and pool to `bins`."""
+    """Slice the high-res spectrum to [vc±vs/2], pool to `bins`, and return the
+    slice with the EXACT frequency bounds it represents (bin-aligned) so the UI maps
+    the signal to the right pixel — otherwise sub-bin rounding makes it drift on zoom.
+    Returns (db_list, actual_center_khz, actual_span_khz)."""
     lo_khz = center - SPAN_KHZ / 2
-    i0 = int((vc - vs / 2 - lo_khz) / SPAN_KHZ * len(hi))
-    i1 = int((vc + vs / 2 - lo_khz) / SPAN_KHZ * len(hi))
+    binkhz = SPAN_KHZ / len(hi)
+    i0 = int(round((vc - vs / 2 - lo_khz) / binkhz))
+    i1 = int(round((vc + vs / 2 - lo_khz) / binkhz))
     i0 = max(0, min(len(hi) - 2, i0)); i1 = max(i0 + 1, min(len(hi), i1))
-    return _downsample(hi[i0:i1], bins)
+    seg = hi[i0:i1]
+    if len(seg) > bins:                       # pooled: covers exactly step*bins input bins
+        step = len(seg) // bins
+        seg = seg[:step * bins].reshape(bins, step).max(1)
+        used = step * bins
+    else:
+        used = len(seg)
+    act_lo = lo_khz + i0 * binkhz
+    act_hi = lo_khz + (i0 + used) * binkhz
+    return seg, (act_lo + act_hi) / 2, act_hi - act_lo
 
 
 _AI = "unset"          # lazy-loaded neural decoder: (model, torch) | None
@@ -629,9 +642,9 @@ class H(BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 vs = vc = None
             if vs is not None and hi is not None and vs < SPAN_KHZ - 1:
-                sl = _view_slice(hi, center, vc, vs)
+                sl, actc, acts = _view_slice(hi, center, vc, vs)
                 out = {"db": sl.tolist(), "peak": float(sl.max()),
-                       "noise": float(np.percentile(sl, 25)), "center": vc, "span": vs}
+                       "noise": float(np.percentile(sl, 25)), "center": actc, "span": acts}
             else:
                 out = {"db": ov, "peak": peak, "noise": noise,
                        "center": center, "span": SPAN_KHZ}
@@ -687,7 +700,14 @@ class H(BaseHTTPRequestHandler):
                         binkhz = SPAN_KHZ / len(hi)
                         lo0 = c - SPAN_KHZ / 2
                         i = int(round((khz - lo0) / binkhz))
-                        win = max(2, int(0.6 / binkhz))          # +/-600 Hz search
+                        # search window scales with zoom (passed as 'win' kHz): tiny
+                        # when zoomed in so the cursor lands where you clicked, only
+                        # nudging onto the exact peak.
+                        try:
+                            winkhz = min(3.0, max(0.05, float(q["win"][0])))
+                        except (KeyError, ValueError):
+                            winkhz = 0.15
+                        win = max(1, int(winkhz / binkhz))
                         a = max(0, i - win); b = min(len(hi), i + win + 1)
                         if b > a:
                             bi = a + int(np.argmax(hi[a:b]))
@@ -998,7 +1018,8 @@ async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;
 function snap(e,c){if(e.button&&e.button!==0)return;if(VC===null)return;
   const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
   const f=VC-VS/2+fx*VS;
-  api('/tune?snap=1&khz='+f.toFixed(3)).then(refresh);}
+  const win=(VS*0.02).toFixed(3);         // snap window = 2% of the view -> precise when zoomed in
+  api('/tune?snap=1&khz='+f.toFixed(3)+'&win='+win).then(refresh);}
 // Controls: SCROLL = zoom, MIDDLE-DRAG = pan, LEFT-CLICK = snap cursor to signal,
 // DOUBLE-CLICK = reset to full band. (Middle-click autoscroll fully suppressed.)
 for(const c of [spec,wf]){
