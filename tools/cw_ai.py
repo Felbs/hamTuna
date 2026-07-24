@@ -189,6 +189,87 @@ def _producer(q, stop, batch, seed, torch, noise_pool=None):
                 pass
 
 
+def _exact_clip(seed):
+    """One EXACT-match labeled clip: synth IQ -> cw.envelope (identical to real)."""
+    rng = np.random.default_rng(seed)
+    text = cw_synth.random_text(rng)
+    iq, fsq, f0 = cw_synth.render_iq(
+        text, wpm=int(rng.integers(12, 34)), fs_iq=24000.0,
+        jitter=float(rng.uniform(0.05, 0.22)), weight=float(rng.uniform(0.9, 1.35)),
+        noise=float(rng.uniform(0.05, 0.5)), fade=float(rng.choice([0.0, 0.0, 0.4, 0.6, 0.75])),
+        fade_hz=float(rng.uniform(0.2, 1.5)), rise_ms=float(rng.uniform(2, 8)),
+        seed=int(rng.integers(1, 1_000_000)))
+    env, aud = cw.envelope(iq, fsq, f0)
+    lab = encode_label(text)
+    return (env_to_feat(env, aud).astype(np.float32), np.array(lab, np.int64)) if lab else None
+
+
+def build_exact_pool(n=20000, workers=16, cache=None):
+    """Parallel-generate an exact-match pool once (~8 min for 20k on 16 threads)."""
+    from concurrent.futures import ThreadPoolExecutor
+    cache = cache or (HERE.parent / "lab" / "exact_pool.npz")
+    print(f"building exact-match pool ({n} clips, {workers} threads)...", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        pool = [r for r in ex.map(_exact_clip, range(n)) if r is not None]
+    print(f"pool built: {len(pool)} clips", flush=True)
+    return pool
+
+
+def train_exact(steps=12000, batch=48, lr=1.5e-3, pool_size=20000, seed=1):
+    """EXP-6: train on an EXACT-match (IQ->cw.envelope) pool, checkpoint on the
+    honest CALLSIGN-RECALL metric (11 held-out real captures) - fixes both the
+    sim-to-real gap and the overfit-to-2-caps selection problem."""
+    import torch
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"train_exact on {dev} batch={batch} steps={steps}", flush=True)
+    pool = build_exact_pool(pool_size)
+    if len(pool) < batch:
+        print("pool too small"); return
+    cval = _load_callsign_val()
+    real_val = _load_real_val()
+    print(f"callsign-val {len(cval)} caps, full-label val {len(real_val)}", flush=True)
+    model = _build_model().to(dev)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps, eta_min=2e-4)
+    ctc = torch.nn.CTCLoss(blank=BLANK, zero_infinity=True)
+    rng = np.random.default_rng(seed)
+    model.train()
+    run, best = 0.0, -1.0
+    for step in range(1, steps + 1):
+        idx = rng.integers(0, len(pool), batch)
+        feats = [pool[i][0] for i in idx]; labs = [pool[i][1] for i in idx]
+        keep = [(f, l) for f, l in zip(feats, labs) if len(f) >= DOWN * (len(l) + 2)]
+        if len(keep) < 2:
+            continue
+        T = max(len(f) for f, _ in keep)
+        X = np.zeros((len(keep), 1, T), np.float32)
+        for i, (f, _) in enumerate(keep):
+            X[i, 0, :len(f)] = f
+        y = torch.tensor([c for _, l in keep for c in l], dtype=torch.long)
+        il = torch.tensor([len(f) // DOWN for f, _ in keep], dtype=torch.long)
+        tl = torch.tensor([len(l) for _, l in keep], dtype=torch.long)
+        lp = model(torch.from_numpy(X).to(dev)).transpose(0, 1)
+        il = torch.clamp(il, max=lp.shape[0])
+        loss = ctc(lp, y.to(dev), il, tl)
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        opt.step(); sched.step()
+        run += float(loss.detach())
+        if step % 200 == 0:
+            rec = _callsign_recall(model, cval, torch)          # maximize this
+            vc = _val_cer(model, torch, n=40, seed=999)
+            print(f"  step {step:6d}/{steps} loss={run/200:.3f} synthCER={vc:.3f} "
+                  f"callsignRECALL={rec if rec is None else round(rec,3)} "
+                  f"lr={sched.get_last_lr()[0]:.1e}", flush=True)
+            run = 0.0
+            if rec is not None and rec >= best:
+                best = rec
+                torch.save(model.state_dict(), HERE.parent / "lab" / "morse_ai_exact.pt")
+                print(f"    * checkpoint (best callsignRECALL={best:.3f})", flush=True)
+    print(f"done. best callsignRECALL={best:.3f} -> lab/morse_ai_exact.pt", flush=True)
+    return model
+
+
 def train(steps=20000, batch=48, lr=2e-3, seed=1, workers=6, resume=True):
     import queue
     import threading
@@ -286,6 +367,41 @@ def _load_real_val():
     return out
 
 
+def _load_callsign_val():
+    """Load harvested captures that have DB-verified callsigns (eye>=3.0) as a
+    callsign-RECALL validation set: reliable ground truth (a random garbage string
+    rarely DB-verifies), far less noisy than 2 full-text labels, and it measures the
+    thing we actually care about - reading real callsigns."""
+    import glob
+    import json
+    out = []
+    for j in sorted(glob.glob(str(HERE.parent / "lab" / "cw_harvest" / "*.json"))):
+        try:
+            d = json.loads(Path(j).read_text())
+            calls = [c["call"] for c in d.get("verified_calls", [])]
+            if calls and float(d.get("eye", 0)) >= 3.0:
+                iq = _load_iq(str(HERE.parent / "lab" / "cw_harvest" / d["iq_file"]))
+                off = cw.find_offset(iq, FS, 3000)
+                env, aud = cw.envelope(iq, FS, off)
+                out.append((env_to_feat(env, aud), set(calls)))
+        except Exception:
+            continue
+    return out
+
+
+def _callsign_recall(model, cval, torch):
+    """Fraction of verified callsigns the model actually decodes (token recall)."""
+    if not cval:
+        return None
+    import cw_lm
+    hit, tot = 0, 0
+    for feat, calls in cval:
+        toks = set(cw_lm.rescore(decode_feat(model, feat, torch)).split())
+        hit += sum(1 for c in calls if c in toks); tot += len(calls)
+    model.train()
+    return hit / max(tot, 1)
+
+
 def _real_cer(model, real_val, torch):
     if not real_val:
         return None
@@ -321,11 +437,15 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train"); t.add_argument("--steps", type=int, default=20000)
     t.add_argument("--batch", type=int, default=48)
+    te = sub.add_parser("train-exact"); te.add_argument("--steps", type=int, default=12000)
+    te.add_argument("--batch", type=int, default=48); te.add_argument("--pool", type=int, default=20000)
     sub.add_parser("test")
     d = sub.add_parser("decode"); d.add_argument("file")
     a = ap.parse_args()
     if a.cmd == "train":
         train(steps=a.steps, batch=a.batch)
+    elif a.cmd == "train-exact":
+        train_exact(steps=a.steps, batch=a.batch, pool_size=a.pool)
     elif a.cmd == "test":
         model, torch = load_model()
         print(f"held-out synthetic CER: {_val_cer(model, torch, n=100, seed=555):.3f}")

@@ -205,21 +205,23 @@ def decode_cw(iq):
     if not STATE["chlock"]:
         STATE["last_off"] = off
     env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
-    # NEURAL decoder first (trained CNN-BiLSTM-CTC, reads real callsigns); falls
-    # back to the apparatus-routed classic/matched-filter decoder if it's absent
-    # or produces nothing.
+    # CLASSIC apparatus-routed decoder is PRIMARY: on held-out real captures it
+    # reads verified callsigns 13/13 while the current neural model (overfit to its
+    # 2-capture validation set) reads 0/13. The neural path is opt-in (STATE['use_ai'])
+    # until it actually beats classic on the callsign-recall metric.
     txt, info = cw.decode_env_auto(env, aud)
     route = info.get("route", "classic")
-    ai = _get_ai()
-    if ai is not None:
-        try:
-            import cw_ai
-            wenv, waud = cw.envelope(iq, FS, off)         # match the AI's training pipeline
-            ai_txt = cw_ai.decode_feat(ai[0], cw_ai.env_to_feat(wenv, waud), ai[1])
-            if ai_txt and len([c for c in ai_txt if c != " "]) >= 3:
-                txt, route = ai_txt, "neural"
-        except Exception:
-            pass
+    if STATE.get("use_ai"):
+        ai = _get_ai()
+        if ai is not None:
+            try:
+                import cw_ai
+                wenv, waud = cw.envelope(iq, FS, off)
+                ai_txt = cw_ai.decode_feat(ai[0], cw_ai.env_to_feat(wenv, waud), ai[1])
+                if ai_txt and len([c for c in ai_txt if c != " "]) >= 3:
+                    txt, route = ai_txt, "neural"
+            except Exception:
+                pass
     txt = cw_lm.rescore(txt)                          # ham LM: re-segment words + repair '?'
     chars = [c for c in txt if c != " "]
     q = round(sum(1 for c in chars if c != "?") / len(chars), 3) if chars else 0.0
