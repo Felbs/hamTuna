@@ -617,23 +617,24 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/":
             self._send(PAGE, "text/html; charset=utf-8")
         elif u.path == "/spectrum":
-            # optional zoom view: vc=view center kHz, vs=view span kHz. Slices the
-            # high-res spectrum for real resolution when zoomed in.
+            # optional zoom view: vc/vs = view center/span kHz. Grab refs under the
+            # lock, then do the numpy slicing OUTSIDE it (hi is replaced whole each
+            # reader cycle, never mutated in place) so the draw loop can't contend
+            # with the SDR reader and freeze the server.
             with _lock:
-                center = STATE["center_khz"]; hi = SPEC["hi"]
+                center = STATE["center_khz"]; hi = SPEC["hi"]; ov = SPEC["db"]
                 peak, noise = SPEC["peak_db"], SPEC["noise_db"]
-                try:
-                    vs = float(q["vs"][0]); vc = float(q["vc"][0])
-                except (KeyError, ValueError):
-                    vs = vc = None
-                if vs is not None and hi is not None and vs < SPAN_KHZ - 1:
-                    sl = _view_slice(hi, center, vc, vs)
-                    db = sl.tolist()
-                    peak = float(sl.max()); noise = float(np.percentile(sl, 25))
-                    out = {"db": db, "peak": peak, "noise": noise, "center": vc, "span": vs}
-                else:
-                    out = {"db": SPEC["db"], "peak": peak, "noise": noise,
-                           "center": center, "span": SPAN_KHZ}
+            try:
+                vs = float(q["vs"][0]); vc = float(q["vc"][0])
+            except (KeyError, ValueError):
+                vs = vc = None
+            if vs is not None and hi is not None and vs < SPAN_KHZ - 1:
+                sl = _view_slice(hi, center, vc, vs)
+                out = {"db": sl.tolist(), "peak": float(sl.max()),
+                       "noise": float(np.percentile(sl, 25)), "center": vc, "span": vs}
+            else:
+                out = {"db": ov, "peak": peak, "noise": noise,
+                       "center": center, "span": SPAN_KHZ}
             self._send(json.dumps(out))
         elif u.path == "/state":
             with _lock:
@@ -886,15 +887,6 @@ function onPanStart(e){if(e.button!==1)return;e.preventDefault();panning=true;
 function onPanMove(e){if(!panning)return;const r=e.currentTarget.getBoundingClientRect();
   const dkhz=(e.clientX-panX)/r.width*VIEW.s;VIEW.c=panC-dkhz;clampView();wfDirty=true;}
 function onPanEnd(){panning=false;}
-// keyboard: LEFT/RIGHT = move the tuning cursor (fine tune), UP/DOWN = zoom
-addEventListener('keydown',e=>{
-  const t=(e.target.tagName||'');if(t==='INPUT'||t==='TEXTAREA')return;
-  if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();
-    const base=(ST.tune_khz||ST.center_khz||SDRCENTER||0);
-    const stepk=Math.max(0.02,(VS||FULLSPAN)*0.004);       // finer step when zoomed in
-    tune((base+(e.key==='ArrowRight'?stepk:-stepk)).toFixed(2));}
-  else if(e.key==='ArrowUp'){e.preventDefault();zoomBy(0.66,0.5);}
-  else if(e.key==='ArrowDown'){e.preventDefault();zoomBy(1.5,0.5);}});
 let lastCenter=null;
 async function refresh(){
   ST=await api('/state');
@@ -975,17 +967,18 @@ function snap(e,c){if(e.button&&e.button!==0)return;if(!DB.length||VC===null)ret
   let lo=Math.max(0,i0-w),hi=Math.min(DB.length,i0+w),bi=i0,bv=-1e9;
   for(let i=lo;i<hi;i++)if(DB[i]>bv){bv=DB[i];bi=i;}
   const f=VC-VS/2+(bi/DB.length)*VS;tune(f.toFixed(2));}
+// Controls: SCROLL = zoom, MIDDLE-DRAG = pan, LEFT-CLICK = snap cursor to signal,
+// DOUBLE-CLICK = reset to full band. (Middle-click autoscroll fully suppressed.)
 for(const c of [spec,wf]){
-  c.addEventListener('click',e=>snap(e,c));
   c.addEventListener('wheel',onWheel,{passive:false});
-  c.addEventListener('mousedown',onPanStart);
+  c.addEventListener('mousedown',e=>{if(e.button===1){e.preventDefault();onPanStart(e);}});
   c.addEventListener('mousemove',onPanMove);
+  c.addEventListener('click',e=>{if(!e.button)snap(e,c);});
   c.addEventListener('dblclick',e=>{e.preventDefault();viewReset();});
-  c.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});
+  c.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});   // kill autoscroll
+  c.addEventListener('contextmenu',e=>e.preventDefault());
 }
 addEventListener('mouseup',onPanEnd);
-// suppress middle-click autoscroll on the canvases
-for(const c of [spec,wf])c.addEventListener('pointerdown',e=>{if(e.button===1)e.preventDefault();});
 let listening=false;
 function togListen(){const a=$('au');listening=!listening;$('listenb').classList.toggle('on',listening);
   if(listening){a.src='/cw_audio.wav?'+Date.now();a.play().catch(()=>{});$('listenb').innerHTML='&#9632; STOP audio';}
