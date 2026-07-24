@@ -1021,9 +1021,8 @@ async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;
 // sits precisely on the signal and stays locked to it through any zoom.
 function snap(e,c){if(e.button&&e.button!==0)return;if(VC===null)return;
   const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
-  const f=VC-VS/2+fx*VS;
-  const win=Math.min(3,Math.max(0.5,VS*0.02)).toFixed(3);  // snap to the true carrier within
-  api('/tune?snap=1&khz='+f.toFixed(3)+'&win='+win).then(refresh);}  // >=500Hz so a near click grabs the signal
+  const f=VC-VS/2+fx*VS;                  // the mouse IS the target: cursor goes exactly here
+  api('/tune?khz='+f.toFixed(3)).then(refresh);}  // (decoder finds the carrier within +/-700Hz on its own)
 // Controls: SCROLL = zoom, MIDDLE-DRAG = pan, LEFT-CLICK = snap cursor to signal,
 // DOUBLE-CLICK = reset to full band. (Middle-click autoscroll fully suppressed.)
 for(const c of [spec,wf]){
