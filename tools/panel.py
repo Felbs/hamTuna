@@ -607,6 +607,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(b)
 
@@ -860,23 +861,31 @@ function viewInit(center,span){FULLSPAN=span;SDRCENTER=center;
   if(VIEW.c===null){VIEW.c=center;VIEW.s=span;}}
 function viewReset(){if(SDRCENTER!==null){VIEW.c=SDRCENTER;VIEW.s=FULLSPAN;}}
 function clampView(){const half=VIEW.s/2, lo=SDRCENTER-FULLSPAN/2+half, hi=SDRCENTER+FULLSPAN/2-half;
-  VIEW.s=Math.max(2,Math.min(FULLSPAN,VIEW.s));   // 2 kHz min zoom
+  VIEW.s=Math.max(1,Math.min(FULLSPAN,VIEW.s));   // 1 kHz deepest zoom
   if(VIEW.s>=FULLSPAN){VIEW.c=SDRCENTER;}else{VIEW.c=Math.max(lo,Math.min(hi,VIEW.c));}}
-function xToKhz(e,c){const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
-  return (VC!==null?VC-VS/2+fx*VS:SDRCENTER);}
-function onWheel(e){e.preventDefault();if(SDRCENTER===null)return;
-  const fk=xToKhz(e,e.currentTarget);                       // freq under the cursor
-  const factor=e.deltaY>0?1.25:0.8;                          // scroll up = zoom in
-  const before=VIEW.s;VIEW.s*=factor;clampView();
-  // keep the freq under the cursor fixed while zooming
-  const r=e.currentTarget.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
-  VIEW.c=fk-(fx-0.5)*VIEW.s;clampView();}
+function zoomBy(factor,fx){          // fx = 0..1 anchor point across the canvas
+  if(SDRCENTER===null||VC===null)return;
+  const fk=VC-VS/2+fx*VS;            // freq under the anchor right now
+  VIEW.s=VS*factor;clampView();
+  VIEW.c=fk-(fx-0.5)*VIEW.s;clampView();}   // hold that freq under the anchor
+function onWheel(e){e.preventDefault();
+  const r=e.currentTarget.getBoundingClientRect();
+  zoomBy(e.deltaY>0?1.5:0.66,(e.clientX-r.left)/r.width);}   // scroll UP = zoom IN
 let panning=false,panX=0,panC=0;
 function onPanStart(e){if(e.button!==1)return;e.preventDefault();panning=true;
   panX=e.clientX;panC=VIEW.c;}
 function onPanMove(e){if(!panning)return;const r=e.currentTarget.getBoundingClientRect();
   const dkhz=(e.clientX-panX)/r.width*VIEW.s;VIEW.c=panC-dkhz;clampView();}
 function onPanEnd(){panning=false;}
+// keyboard: LEFT/RIGHT = move the tuning cursor (fine tune), UP/DOWN = zoom
+addEventListener('keydown',e=>{
+  const t=(e.target.tagName||'');if(t==='INPUT'||t==='TEXTAREA')return;
+  if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();
+    const base=(ST.tune_khz||ST.center_khz||SDRCENTER||0);
+    const stepk=Math.max(0.02,(VS||FULLSPAN)*0.004);       // finer step when zoomed in
+    tune((base+(e.key==='ArrowRight'?stepk:-stepk)).toFixed(2));}
+  else if(e.key==='ArrowUp'){e.preventDefault();zoomBy(0.66,0.5);}
+  else if(e.key==='ArrowDown'){e.preventDefault();zoomBy(1.5,0.5);}});
 let lastCenter=null;
 async function refresh(){
   ST=await api('/state');
@@ -997,12 +1006,17 @@ async function draw(){
   if(ST.tune_khz&&VS){const cx=(ST.tune_khz-(VC-VS/2))/VS*w;
     const vis=cx>=0&&cx<=w;cl.style.display=vis?'block':'none';
     cl.style.left=cx+'px';cl.style.background=ST.chlock?'#f0b23a':'rgba(255,255,255,.92)';}
+  // frequency axis — the kHz labels visibly compress as you zoom (clear feedback)
+  sx.fillStyle='rgba(150,185,205,.75)';sx.font='10px ui-monospace,monospace';sx.textAlign='center';
+  for(let i=0;i<=4;i++){const fk=VC-VS/2+i/4*VS,x=Math.max(24,Math.min(w-24,i/4*w));
+    sx.fillText(fk.toFixed(VS<40?2:0),x,h-19);}
+  sx.textAlign='left';
   // zoom readout + controls hint (top-left of the spectrum)
-  sx.fillStyle='rgba(120,200,220,.85)';sx.font='11px ui-monospace,monospace';
-  const zt=(VS<FULLSPAN-0.5?('🔍 '+VS.toFixed(1)+' kHz span'):('full '+VS.toFixed(0)+' kHz'));
+  sx.fillStyle='rgba(120,200,220,.9)';sx.font='11px ui-monospace,monospace';
+  const zt=(VS<FULLSPAN-0.5)?('🔍 zoom '+VS.toFixed(1)+' kHz span'):('full band '+VS.toFixed(0)+' kHz');
   sx.fillText(zt,8,15);
   sx.fillStyle='rgba(120,150,170,.6)';
-  sx.fillText('scroll: zoom · middle-drag: pan · dbl-click: reset',8,h-8);
+  sx.fillText('scroll: zoom · ←/→: tune · ↑/↓: zoom · drag: pan · dblclick: reset',8,h-6);
   setTimeout(draw,140);
 }
 refresh();setInterval(refresh,1500);draw();
