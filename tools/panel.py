@@ -759,6 +759,9 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>hamTuna</title>
 .wrap{display:grid;grid-template-columns:1fr 320px;height:calc(100vh - 52px)}
 .left{display:flex;flex-direction:column;min-width:0;position:relative}
 .curline{position:absolute;top:0;bottom:0;width:2px;pointer-events:none;background:#fff;box-shadow:0 0 8px currentColor;z-index:5;transition:left .12s}
+.zoomctl{position:absolute;top:8px;right:10px;display:flex;flex-direction:column;gap:5px;z-index:6}
+.zoomctl button{width:32px;height:32px;font-size:17px;font-weight:700;background:rgba(8,22,28,.88);color:#7fd6e6;border:1px solid #1c4a58;border-radius:6px;cursor:pointer;line-height:1}
+.zoomctl button:hover{background:#14303a;color:#aeeaf5}
 #spec{background:#000;flex:0 0 190px;width:100%;cursor:crosshair}#wf{background:#000;flex:1;width:100%;cursor:crosshair}
 .side{border-left:1px solid var(--hair);background:var(--panel);padding:12px;overflow-y:auto;display:flex;flex-direction:column;gap:13px}
 .row{display:flex;flex-wrap:wrap;gap:6px}
@@ -807,7 +810,12 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
   <div class=sub>click a signal &rarr; snap to its peak</div>
 </div>
 <div class=wrap>
-  <div class=left><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div></div>
+  <div class=left><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div>
+    <div class=zoomctl>
+      <button onclick="zoomBy(0.6,0.5)" title="zoom in (narrower band)">+</button>
+      <button onclick="zoomBy(1.7,0.5)" title="zoom out">&minus;</button>
+      <button onclick="viewReset()" title="full band">&#10530;</button>
+    </div></div>
   <div class=side>
     <div><div class=lbl>Band</div><div class=row id=bands></div></div>
     <button class=advb onclick=advise()>📡 Where's the CW right now?</button>
@@ -856,10 +864,10 @@ async function api(p){return (await fetch(p)).json();}
 let DB=[];
 // waterfall navigation: VIEW = the visible freq window (c=center kHz, s=span kHz).
 // null span = full band. VC/VS = the actual window the last /spectrum returned.
-let VIEW={c:null,s:null}, VC=null, VS=null, FULLSPAN=250, SDRCENTER=null;
+let VIEW={c:null,s:null}, VC=null, VS=null, FULLSPAN=250, SDRCENTER=null, wfDirty=false;
 function viewInit(center,span){FULLSPAN=span;SDRCENTER=center;
   if(VIEW.c===null){VIEW.c=center;VIEW.s=span;}}
-function viewReset(){if(SDRCENTER!==null){VIEW.c=SDRCENTER;VIEW.s=FULLSPAN;}}
+function viewReset(){if(SDRCENTER!==null){VIEW.c=SDRCENTER;VIEW.s=FULLSPAN;wfDirty=true;}}
 function clampView(){const half=VIEW.s/2, lo=SDRCENTER-FULLSPAN/2+half, hi=SDRCENTER+FULLSPAN/2-half;
   VIEW.s=Math.max(1,Math.min(FULLSPAN,VIEW.s));   // 1 kHz deepest zoom
   if(VIEW.s>=FULLSPAN){VIEW.c=SDRCENTER;}else{VIEW.c=Math.max(lo,Math.min(hi,VIEW.c));}}
@@ -867,7 +875,8 @@ function zoomBy(factor,fx){          // fx = 0..1 anchor point across the canvas
   if(SDRCENTER===null||VC===null)return;
   const fk=VC-VS/2+fx*VS;            // freq under the anchor right now
   VIEW.s=VS*factor;clampView();
-  VIEW.c=fk-(fx-0.5)*VIEW.s;clampView();}   // hold that freq under the anchor
+  VIEW.c=fk-(fx-0.5)*VIEW.s;clampView();   // hold that freq under the anchor
+  wfDirty=true;}                     // rebuild the waterfall at the new scale
 function onWheel(e){e.preventDefault();
   const r=e.currentTarget.getBoundingClientRect();
   zoomBy(e.deltaY>0?1.5:0.66,(e.clientX-r.left)/r.width);}   // scroll UP = zoom IN
@@ -875,7 +884,7 @@ let panning=false,panX=0,panC=0;
 function onPanStart(e){if(e.button!==1)return;e.preventDefault();panning=true;
   panX=e.clientX;panC=VIEW.c;}
 function onPanMove(e){if(!panning)return;const r=e.currentTarget.getBoundingClientRect();
-  const dkhz=(e.clientX-panX)/r.width*VIEW.s;VIEW.c=panC-dkhz;clampView();}
+  const dkhz=(e.clientX-panX)/r.width*VIEW.s;VIEW.c=panC-dkhz;clampView();wfDirty=true;}
 function onPanEnd(){panning=false;}
 // keyboard: LEFT/RIGHT = move the tuning cursor (fine tune), UP/DOWN = zoom
 addEventListener('keydown',e=>{
@@ -996,7 +1005,9 @@ async function draw(){
   const lo=s.noise-6,hi=s.peak+6,rng=Math.max(6,hi-lo);
   sx.strokeStyle='#2ee6c8';sx.lineWidth=1.4;sx.shadowColor='#2ee6c8';sx.shadowBlur=6;sx.beginPath();
   for(let i=0;i<db.length;i++){const x=i/db.length*w,y=h-(db[i]-lo)/rng*h;i?sx.lineTo(x,y):sx.moveTo(x,y);}sx.stroke();sx.shadowBlur=0;
-  const cwd=wf.width,ch=wf.height;wx.putImageData(wx.getImageData(0,0,cwd,ch),0,1);
+  const cwd=wf.width,ch=wf.height;
+  if(wfDirty){wx.fillStyle='#000';wx.fillRect(0,0,cwd,ch);wfDirty=false;}  // rebuild at new zoom
+  wx.putImageData(wx.getImageData(0,0,cwd,ch),0,1);
   const row=wx.createImageData(cwd,1);
   for(let x=0;x<cwd;x++){const i=Math.floor(x/cwd*db.length);let v=(db[i]-lo)/rng;const c=oled(v);
     row.data[x*4]=c[0];row.data[x*4+1]=c[1];row.data[x*4+2]=c[2];row.data[x*4+3]=255;}
