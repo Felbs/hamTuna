@@ -473,7 +473,7 @@ class SDRWorker(threading.Thread):
                 cur = STATE["center_khz"]
                 sdr.setFrequency(SOAPY_SDR_RX, 0, cur * 1e3)
                 ring_clear(); self.zi = None; time.sleep(0.15)
-            r = sdr.readStream(st, [buf], 65536, timeoutUs=500000)
+            r = sdr.readStream(st, [buf], 16384, timeoutUs=500000)  # small reads = fast waterfall (~15 rows/s)
             if r.ret <= 0:
                 continue
             iq = ((buf[0:2 * r.ret:2].astype(np.float32)
@@ -775,7 +775,9 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>hamTuna</title>
 .freq small{font-size:13px;color:var(--mut)}.sub{color:var(--mut);font-size:12px}
 .wrap{display:grid;grid-template-columns:1fr 320px;height:calc(100vh - 52px)}
 .left{display:flex;flex-direction:column;min-width:0;position:relative}
-.curline{position:absolute;top:0;bottom:0;width:2px;pointer-events:none;background:#fff;box-shadow:0 0 8px currentColor;z-index:5;transition:left .12s}
+.curline{position:absolute;top:0;bottom:0;width:2px;pointer-events:none;background:#fff;color:#ffd84a;box-shadow:0 0 6px currentColor;z-index:5}
+.curline::before{content:'';position:absolute;top:0;left:-5px;border-left:6px solid transparent;border-right:6px solid transparent;border-top:9px solid currentColor}
+.curline::after{content:'';position:absolute;bottom:0;left:-5px;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:9px solid currentColor}
 .zoomctl{position:absolute;top:8px;right:10px;display:flex;flex-direction:column;gap:5px;z-index:6}
 .zoomctl button{width:32px;height:32px;font-size:17px;font-weight:700;background:rgba(8,22,28,.88);color:#7fd6e6;border:1px solid #1c4a58;border-radius:6px;cursor:pointer;line-height:1}
 .zoomctl button:hover{background:#14303a;color:#aeeaf5}
@@ -1035,11 +1037,14 @@ async function draw(){
   for(let x=0;x<cwd;x++){const i=Math.floor(x/cwd*db.length);let v=(db[i]-lo)/rng;const c=oled(v);
     row.data[x*4]=c[0];row.data[x*4+1]=c[1];row.data[x*4+2]=c[2];row.data[x*4+3]=255;}
   wx.putImageData(row,0,0);
-  // tuning cursor overlay (spans spectrum + waterfall); hidden if panned off-view
+  // tuning cursor overlay (spans spectrum + waterfall); hidden if panned off-view.
+  // A top marker triangle makes the locked freq findable even when the signal is
+  // sub-pixel-thin behind the line (e.g. zoomed all the way out).
   const cl=$('curline');
   if(ST.tune_khz&&VS){const cx=(ST.tune_khz-(VC-VS/2))/VS*w;
-    const vis=cx>=0&&cx<=w;cl.style.display=vis?'block':'none';
-    cl.style.left=cx+'px';cl.style.background=ST.chlock?'#f0b23a':'rgba(255,255,255,.92)';}
+    const vis=cx>=-1&&cx<=w+1;cl.style.display=vis?'block':'none';
+    const col=ST.chlock?'#f0b23a':'#ffd84a';        // amber locked / yellow otherwise (high contrast on the OLED waterfall)
+    cl.style.left=cx+'px';cl.style.background=col;cl.style.color=col;}
   // frequency axis — the kHz labels visibly compress as you zoom (clear feedback)
   sx.fillStyle='rgba(150,185,205,.75)';sx.font='10px ui-monospace,monospace';sx.textAlign='center';
   for(let i=0;i<=4;i++){const fk=VC-VS/2+i/4*VS,x=Math.max(24,Math.min(w-24,i/4*w));
@@ -1051,7 +1056,7 @@ async function draw(){
   sx.fillText(zt,8,15);
   sx.fillStyle='rgba(120,150,170,.6)';
   sx.fillText('scroll: zoom · ←/→: tune · ↑/↓: zoom · drag: pan · dblclick: reset',8,h-6);
-  setTimeout(draw,140);
+  setTimeout(draw,60);   // fast waterfall / live feedback (~15 rows/s)
 }
 refresh();setInterval(refresh,1500);draw();
 setInterval(pollSignals,2500);pollSignals();
