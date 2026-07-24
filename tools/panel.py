@@ -676,9 +676,25 @@ class H(BaseHTTPRequestHandler):
                                    "found_cw": bool(cw_sigs), "n_cw": len(cw_sigs)}))
         elif u.path == "/tune":                # move the CURSOR within the window
             try:
-                lo = STATE["center_khz"] - SPAN_KHZ / 2 + 1
-                hi = STATE["center_khz"] + SPAN_KHZ / 2 - 1
-                STATE["tune_khz"] = round(min(hi, max(lo, float(q["khz"][0]))), 2)
+                khz = float(q["khz"][0])
+                # snap=1: refine to the TRUE peak in the high-res (~30 Hz) spectrum
+                # near the click, so the cursor lands exactly on the signal and stays
+                # locked to it at any zoom (coarse display bins otherwise drift on zoom)
+                if q.get("snap", ["0"])[0] == "1":
+                    with _lock:
+                        hi = SPEC["hi"]; c = STATE["center_khz"]
+                    if hi is not None and len(hi):
+                        binkhz = SPAN_KHZ / len(hi)
+                        lo0 = c - SPAN_KHZ / 2
+                        i = int(round((khz - lo0) / binkhz))
+                        win = max(2, int(0.6 / binkhz))          # +/-600 Hz search
+                        a = max(0, i - win); b = min(len(hi), i + win + 1)
+                        if b > a:
+                            bi = a + int(np.argmax(hi[a:b]))
+                            khz = lo0 + bi * binkhz
+                lo = STATE["center_khz"] - SPAN_KHZ / 2 + 0.5
+                hi_k = STATE["center_khz"] + SPAN_KHZ / 2 - 0.5
+                STATE["tune_khz"] = round(min(hi_k, max(lo, khz)), 3)
                 STATE["chlock"] = False
             except (ValueError, KeyError): pass
             self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"]}))
@@ -974,14 +990,13 @@ async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;
   list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-cur)<0.3;
     const tag=x.cw===true?`<span class=cwtag>&check;CW ${x.wpm}</span>`:(x.cw===false?'<span class="cwtag off">data/busy</span>':'<span class="cwtag off">…</span>');
     return `<div class="sig${on?' on':''}${x.cw===false?' dim':''}" onclick="tune(${x.khz})"><span>${x.khz.toFixed(2)}</span>${tag}<span class=bar><span style="width:${Math.min(100,x.snr*3)}%"></span></span><span class=snr>${x.snr}dB</span></div>`;}).join(''):'<div class=sub style="padding:8px">no CW carriers here — try another band</div>';}
-// left-click a canvas -> snap to the local peak near the click (point-and-click nav)
-function snap(e,c){if(e.button&&e.button!==0)return;if(!DB.length||VC===null)return;
+// left-click -> lock the cursor onto the clicked signal. Send the exact clicked
+// freq and let the backend snap to the TRUE high-res peak (~30 Hz), so the cursor
+// sits precisely on the signal and stays locked to it through any zoom.
+function snap(e,c){if(e.button&&e.button!==0)return;if(VC===null)return;
   const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
-  let i0=Math.floor(fx*DB.length),w=Math.max(4,Math.round(DB.length*0.02)); // ±2% window
-  let lo=Math.max(0,i0-w),hi=Math.min(DB.length,i0+w),bi=i0,bv=-1e9;
-  for(let i=lo;i<hi;i++)if(DB[i]>bv){bv=DB[i];bi=i;}
-  const f=VC-VS/2+(bi/DB.length)*VS;      // lock the cursor onto the signal IN PLACE
-  tune(f.toFixed(2));}                    // (no view recenter — zoom pivots on it)
+  const f=VC-VS/2+fx*VS;
+  api('/tune?snap=1&khz='+f.toFixed(3)).then(refresh);}
 // Controls: SCROLL = zoom, MIDDLE-DRAG = pan, LEFT-CLICK = snap cursor to signal,
 // DOUBLE-CLICK = reset to full band. (Middle-click autoscroll fully suppressed.)
 for(const c of [spec,wf]){
