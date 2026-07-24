@@ -1023,18 +1023,27 @@ function snap(e,c){if(e.button&&e.button!==0)return;if(VC===null)return;
   const r=c.getBoundingClientRect();const fx=(e.clientX-r.left)/r.width;
   const f=VC-VS/2+fx*VS;                  // the mouse IS the target: cursor goes exactly here
   api('/tune?khz='+f.toFixed(3)).then(refresh);}  // (decoder finds the carrier within +/-700Hz on its own)
-// Controls: SCROLL = zoom, MIDDLE-DRAG = pan, LEFT-CLICK = snap cursor to signal,
-// DOUBLE-CLICK = reset to full band. (Middle-click autoscroll fully suppressed.)
+// LEFT click/drag = grab & drag the tuning line exactly under the pointer.
+let curDrag=false, dragKhz=null, lastSend=0;
+function clientKhz(clientX){const r=spec.getBoundingClientRect();
+  const fx=Math.max(0,Math.min(1,(clientX-r.left)/r.width));return VC-VS/2+fx*VS;}
+function onCurDown(e){if(e.button!==0||VC===null)return;e.preventDefault();curDrag=true;onCurMove(e);}
+function onCurMove(e){if(!curDrag)return;dragKhz=clientKhz(e.clientX);
+  const now=performance.now();                       // throttle the tune requests during drag
+  if(now-lastSend>70){lastSend=now;api('/tune?khz='+dragKhz.toFixed(3));}}
+function onCurUp(){if(!curDrag)return;curDrag=false;
+  if(dragKhz!=null){tune(dragKhz.toFixed(3));dragKhz=null;}}
+// Controls: SCROLL = zoom, LEFT click/drag = tune (grab the line), MIDDLE-DRAG = pan,
+// DOUBLE-CLICK = reset. (Middle-click autoscroll suppressed.)
 for(const c of [spec,wf]){
   c.addEventListener('wheel',onWheel,{passive:false});
-  c.addEventListener('mousedown',e=>{if(e.button===1){e.preventDefault();onPanStart(e);}});
-  c.addEventListener('click',e=>{if(!e.button)snap(e,c);});
+  c.addEventListener('mousedown',e=>{if(e.button===1){e.preventDefault();onPanStart(e);}else if(e.button===0)onCurDown(e);});
   c.addEventListener('dblclick',e=>{e.preventDefault();viewReset();});
   c.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});   // kill autoscroll
   c.addEventListener('contextmenu',e=>e.preventDefault());
 }
-addEventListener('mousemove',onPanMove);   // on WINDOW so the drag tracks off-canvas
-addEventListener('mouseup',onPanEnd);
+addEventListener('mousemove',e=>{onPanMove(e);onCurMove(e);});   // WINDOW so drags track off-canvas
+addEventListener('mouseup',e=>{onPanEnd(e);onCurUp(e);});
 let listening=false;
 function togListen(){const a=$('au');listening=!listening;$('listenb').classList.toggle('on',listening);
   if(listening){a.src='/cw_audio.wav?'+Date.now();a.play().catch(()=>{});$('listenb').innerHTML='&#9632; STOP audio';}
@@ -1065,7 +1074,8 @@ async function draw(){
   // A top marker triangle makes the locked freq findable even when the signal is
   // sub-pixel-thin behind the line (e.g. zoomed all the way out).
   const cl=$('curline');
-  if(ST.tune_khz&&VS){const cx=(ST.tune_khz-(VC-VS/2))/VS*w;
+  const tk=(curDrag&&dragKhz!=null)?dragKhz:ST.tune_khz;   // follow the pointer live while dragging
+  if(tk&&VS){const cx=(tk-(VC-VS/2))/VS*w;
     const vis=cx>=-1&&cx<=w+1;cl.style.display=vis?'block':'none';
     const col=ST.chlock?'#f0b23a':'#ffd84a';        // amber locked / yellow otherwise (high contrast on the OLED waterfall)
     cl.style.left=cx+'px';cl.style.background=col;cl.style.color=col;
