@@ -540,11 +540,19 @@ class H(BaseHTTPRequestHandler):
                 STATE["running"] = q["running"][0] == "1"
             self._send(json.dumps({"ok": True}))
         elif u.path == "/autotune":
-            sigs = detect_signals()          # strongest CW carrier in-band (not FT8)
-            if sigs:
-                STATE["tune_khz"] = max(sigs, key=lambda s: s["snr"])["khz"]  # cursor jumps
-                STATE["chlock"] = False
-            self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"]}))
+            # jump the cursor to the best COPYABLE CW (highest eye-opening), not the
+            # loudest carrier (which is usually FT8/data). Falls back to strongest
+            # only if the classifier hasn't found any open-eye CW yet.
+            with _lock:
+                fresh = SIGLIST["band"] == STATE["band"] and SIGLIST["sigs"]
+                sigs = [dict(s) for s in SIGLIST["sigs"]] if fresh else detect_signals()
+            cw_sigs = [s for s in sigs if s.get("cw")]
+            pick = (max(cw_sigs, key=lambda s: s.get("eye", 0)) if cw_sigs
+                    else (max(sigs, key=lambda s: s["snr"]) if sigs else None))
+            if pick:
+                STATE["tune_khz"] = pick["khz"]; STATE["chlock"] = False
+            self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"],
+                                   "found_cw": bool(cw_sigs), "n_cw": len(cw_sigs)}))
         elif u.path == "/tune":                # move the CURSOR within the window
             try:
                 lo = STATE["center_khz"] - SPAN_KHZ / 2 + 1
@@ -675,7 +683,7 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
   <div class=side>
     <div><div class=lbl>Band</div><div class=row id=bands></div></div>
     <div><div class=lbl>Mode</div><div class=row id=modes></div></div>
-    <button class=autob onclick=autotune()>&#9673; AUTO-TUNE (strongest CW)</button>
+    <button class=autob id=autob onclick=autotune()>&#9673; AUTO-TUNE (best copyable CW)</button>
     <button class=lockb id=lockb onclick=togLock()>&#128275; LOCK channel</button>
     <div>
       <div class=lbl style="display:flex;justify-content:space-between;align-items:center">
@@ -755,7 +763,15 @@ async function pollLog(){let s;try{s=await api('/log');}catch(e){return;}
     `<div class=logrow><span class=call>&check; ${c.call}</span><span class=meta>${(c.name||'').split(' ')[0]} &middot; ${c.bands.join('/')} &middot; ${c.points}pt</span></div>`).join('')
     :'<div class=sub>no verified calls yet — tune in a CQ</div>';}
 async function set(kv){await api('/set?'+kv);refresh();}
-async function autotune(){await api('/autotune');refresh();}
+async function autotune(){
+  const b=$('autob'), lbl=b.textContent;
+  b.textContent='… searching for copyable CW …';
+  let r; try{r=await api('/autotune');}catch(e){b.textContent=lbl;return;}
+  await refresh();
+  // real click feedback: report what it found (no silent no-op)
+  b.textContent = r.found_cw ? ('◉ jumped to CW ('+r.n_cw+' copyable)') : '◉ no copyable CW here — try 40m / evening';
+  setTimeout(()=>{b.textContent=lbl;}, 2200);
+}
 async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
 async function togLock(){await api('/lock?on='+(ST.chlock?0:1));refresh();}
 async function tune(khz){await api('/tune?khz='+khz);refresh();}
