@@ -93,7 +93,8 @@ def detect_signals():
 
 STATE = {"center_khz": 14030.0, "tune_khz": 14030.0, "band": "20m", "mode": "CW",
          "ifgr": 30, "rfsel": 0, "running": True, "antenna": "Antenna C",
-         "lock": "none", "err": "", "chlock": False, "lock_off": 0.0, "last_off": 0.0}
+         "lock": "none", "err": "", "chlock": False, "lock_off": 0.0, "last_off": 0.0,
+         "cw_filter_hz": 400}   # CW filter half-width ±Hz (0 = WIDE); default = classic ±400
 # center_khz = the SDR/display center (the window); tune_khz = the CURSOR (the
 # exact freq we decode/listen to, movable within the window, SDRuno-style).
 
@@ -116,17 +117,47 @@ _win_hi = np.hanning(N_HI).astype(np.float32)
 _lp = firwin(159, 1500.0 / (FS / 2)).astype(np.float32)   # audio CW filter
 _narrow8k = firwin(129, 400.0 / 4000.0).astype(np.float32)  # ±400 Hz single-station filter @8 kHz
 
+# ── user-selectable CW filter (EXP-7: a CENTERED narrow filter = ~6× QRM rejection).
+# Half-widths in ±Hz; 0 = WIDE (no narrow stage). Decode + audio both honor it.
+CW_FILTER_CHOICES = (0, 400, 250, 150)
+_dec_taps = {400: _narrow8k}            # decode-path complex LP taps @8 kHz, per bw
+_bp_taps = {}                           # audio bandpass taps @ audio rate, per bw
 
-def envelope_locked(iq, off_hz, aud=8000):
-    """Isolate ONE station: shift its carrier to DC, keep only ±400 Hz (rejects
-    adjacent CW), then envelope — so the cursor copies just that one signal."""
+
+def _decode_taps(bw):
+    t = _dec_taps.get(bw)
+    if t is None:
+        t = firwin(129, bw / 4000.0).astype(np.float32)
+        _dec_taps[bw] = t
+    return t
+
+
+def _audio_bp(bw):
+    """Audio-rate bandpass BFO±bw — the 'tune your ear in' filter."""
+    t = _bp_taps.get(bw)
+    if t is None:
+        nyq = AUD_FS / 2.0
+        lo = max(60.0, BFO_HZ - bw) / nyq
+        hi = min(nyq * 0.9, BFO_HZ + bw) / nyq
+        t = firwin(101, [lo, hi], pass_zero=False).astype(np.float32)
+        _bp_taps[bw] = t
+    return t
+
+
+def envelope_locked(iq, off_hz, aud=8000, bw=None):
+    """Isolate ONE station: shift its carrier to DC, keep only ±bw Hz (rejects
+    adjacent CW — EXP-7's ~6× QRM filter), then envelope. bw=None uses the panel's
+    selected CW filter (STATE cw_filter_hz); bw=0 = WIDE (no narrow stage).
+    NOTE: _decode_taps are designed at 8 kHz — callers must keep aud=8000."""
     from math import gcd
     from scipy.signal import resample_poly
+    if bw is None:
+        bw = STATE.get("cw_filter_hz", 400)
     n = np.arange(len(iq), dtype=np.float64)
     x = (iq * np.exp(-2j * np.pi * off_hz / FS * n)).astype(np.complex64)
     g = gcd(int(aud), int(FS))
     xr = resample_poly(x, int(aud) // g, int(FS) // g)      # complex -> 8 kHz
-    xf = lfilter(_narrow8k, 1.0, xr)                        # tight ±250 Hz
+    xf = lfilter(_decode_taps(bw), 1.0, xr) if bw else xr   # ±bw one-station filter (WIDE skips)
     env = np.abs(xf).astype(np.float32)
     k = max(1, int(aud * 0.008))
     return np.convolve(env, np.ones(k, np.float32) / k, mode="same"), aud
@@ -227,17 +258,66 @@ def _get_ai():
     return _AI
 
 
-def decode_cw(iq):
-    # base = where to look: the locked carrier, or the live cursor. EITHER way
-    # snap ±400 Hz to the actual carrier there (a bin-resolution cursor or a
-    # slightly-off lock is still grabbed), then narrow-filter just that signal.
-    base = STATE["lock_off"] if STATE["chlock"] else cur_off_hz()
-    s = iq[:int(FS)] if len(iq) > FS else iq
-    n = np.arange(len(s))
+# ── auto-centering carrier lock (the cocktail-party lock, queue item #1) ──
+# find_offset picks the strongest POWER near the cursor — in a pileup that locks
+# the loudest neighbour, not the copyable CW, and EXP-7 proved a narrow filter
+# centered wrong DELETES the wanted signal. Instead: take the power peaks near the
+# cursor as candidates, judge each by EYE-OPENING (copyability, like a human ear
+# picking the readable fist out of the pile), and HOLD the winner with hysteresis
+# so the lock doesn't flap between stations mid-QSO. Re-acquires when the user
+# moves the cursor (tune_khz changes).
+TRACK = {"off": None, "eye": 0.0, "khz": None}
+
+
+def _eye_lock(iq, base, search):
+    """Pick the carrier offset near `base` with the openest EYE. Returns (off, eye)."""
+    s = iq[-int(6 * FS):] if len(iq) > 6 * FS else iq       # recent 6 s: cheap + current
+    n = np.arange(len(s), dtype=np.float64)
     x = (s * np.exp(-2j * np.pi * base / FS * n)).astype(np.complex64)
-    off = base + cw.find_offset(x, FS, 700)   # find the carrier within +/-700 Hz of the
-    #                                           cursor (was 400) so a slightly-off click
-    #                                           still lands the decode ON the signal you hear
+    N = 1 << 14
+    m = len(x) // N * N
+    if m < N:
+        return base + cw.find_offset(x, FS, search), 0.0
+    seg = x[:m].reshape(-1, N) * np.hanning(N).astype(np.float32)
+    P = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(0)
+    c = N // 2
+    k = max(2, int(search / (FS / N)))
+    band = P[c - k:c + k]
+    noise = np.median(band)
+    idx = [i for i in range(1, len(band) - 1)
+           if band[i] >= band[i - 1] and band[i] > band[i + 1] and band[i] > 4 * noise]
+    idx.sort(key=lambda i: -band[i])
+    cands = [0.0] + [(i - k) * FS / N for i in idx[:4]]   # 0.0 = exactly where the user pointed
+    if len(cands) == 1:
+        cands.append(cw.find_offset(x, FS, search))
+    best_off, best_eye = cands[0], -1.0
+    for off in cands:                                       # judge by EYE, not power
+        env, _ = envelope_locked(s, base + off, bw=400)
+        eye = cw_quality.eye_opening(env)[0]
+        if eye > best_eye:
+            best_off, best_eye = off, eye
+    # hysteresis: keep the currently-tracked carrier unless the new winner is
+    # CLEARLY better — a mid-QSO key-up must not hand the lock to a neighbour.
+    to = TRACK["off"]
+    if (TRACK["khz"] == STATE["tune_khz"] and to is not None
+            and abs(to - (base + best_off)) > 25):
+        env, _ = envelope_locked(s, to, bw=400)
+        teye = cw_quality.eye_opening(env)[0]
+        if teye >= max(2.0, 0.75 * best_eye):
+            TRACK["eye"] = teye
+            return to, teye
+    TRACK.update(off=base + best_off, eye=best_eye, khz=STATE["tune_khz"])
+    return base + best_off, best_eye
+
+
+def decode_cw(iq):
+    # base = where to look: the locked carrier, or the live cursor. The eye-based
+    # lock then picks the COPYABLE carrier there (not the loudest) and holds it;
+    # the CW filter narrows around that carrier, so the filter is always aimed.
+    base = STATE["lock_off"] if STATE["chlock"] else cur_off_hz()
+    bw = STATE.get("cw_filter_hz", 400)
+    search = min(700.0, float(bw)) if bw else 700.0   # never hunt outside the filter
+    off, lock_eye = _eye_lock(iq, base, search)
     if not STATE["chlock"]:
         STATE["last_off"] = off
     env, aud = envelope_locked(iq, off)   # narrow — decode just that one signal
@@ -284,6 +364,12 @@ def decode_cw(iq):
             "eye_q": round(eye_q, 2), "eye_db": round(eye_db, 1),
             "copy_pct": round(copy_pct), "verdict": verdict,
             "route": route,
+            # the dits-and-dashes the decoder actually heard (educational + shows
+            # WHERE copy got shaky). Raw-decode Morse, so it aligns with the raw
+            # letters even where the LM later re-segments the English above.
+            "morse": info.get("morse", "") if ok else "",
+            "tokens": info.get("tokens", [])[:64] if ok else [],
+            "lock_eye": round(float(lock_eye), 2),
             "elements": info.get("elements", 0), "offset_hz": round(off, 1), "hint": hint}
 
 
@@ -299,9 +385,12 @@ PROSIGN = {"CQ", "DE", "QRL", "QSL", "QSO", "QTH", "QRZ", "QRM", "QRN", "QSB",
            "73", "88", "FB", "OM", "UR", "PSE", "POTA", "SOTA", "WX", "TNX"}
 
 
-def extract_calls(text):
+def extract_calls(text, eye=99.0):
     """Callsign-pattern tokens that are confident: repeated (hams send calls
-    2-3x) or right after DE/CQ. Confidence-gating keeps decode noise out."""
+    2-3x) or right after DE/CQ. CONSENSUS-GATED (EXP-9): agreeing repeats are
+    real signal-redundancy evidence at any eye; the single-shot after-DE/CQ path
+    is only trusted when the eye is OPEN (>=3) — a lone garble following a lucky
+    'DE' in noise was the false-callsign source (the old N2TE/W4TT-from-noise)."""
     toks = text.upper().split()
     out = {}
     for i, t in enumerate(toks):
@@ -309,12 +398,12 @@ def extract_calls(text):
             continue
         conf = 0
         if toks.count(t) >= 2:
-            conf += 2
+            conf += 2                          # >=2 agreeing repeats = consensus
         if i > 0 and toks[i - 1] in ("DE", "CQ"):
-            conf += 2
+            conf += 2 if eye >= 3.0 else 1     # context alone needs an open eye
         if 3 <= len(t) <= 6:
             conf += 1
-        if conf >= 2:
+        if conf >= 2 and (toks.count(t) >= 2 or eye >= 3.0):
             out[t] = max(out.get(t, 0), conf)
     return out
 
@@ -462,6 +551,15 @@ class SDRWorker(threading.Thread):
             self.zi = lfilter_zi(_lp, 1.0).astype(np.float32) * xr[0]
         y, self.zi = lfilter(_lp, 1.0, xr, zi=self.zi)
         a = y[::AUD_DEC]
+        # CW filter on the EAR too: audio-rate bandpass BFO±bw (tune your ear in)
+        bw = STATE.get("cw_filter_hz", 400)
+        if bw:
+            if getattr(self, "aud_bw", None) != bw:
+                self.aud_bw = bw; self.zi2 = None           # re-init state on width change
+            t = _audio_bp(bw)
+            if getattr(self, "zi2", None) is None:
+                self.zi2 = lfilter_zi(t, 1.0).astype(np.float32) * (a[0] if len(a) else 0.0)
+            a, self.zi2 = lfilter(t, 1.0, a, zi=self.zi2)
         pk = float(np.abs(a).max())
         self.agc = max(self.agc * 0.995, pk, 1e-4)
         a16 = np.clip(a / self.agc * 7000.0, -32767, 32767).astype(np.int16)
@@ -547,10 +645,11 @@ class Decoder(threading.Thread):
                     DECODE.update(res)
                     if res["text"]:
                         TRANSCRIPT.append({"ts": time.strftime("%H:%M:%S"),
-                                           "text": res["text"], "q": res["q"]})
+                                           "text": res["text"], "q": res["q"],
+                                           "morse": res.get("morse", "")})
                         snr = round(max(0, SPEC["peak_db"] - SPEC["noise_db"]), 1)
                 if res.get("text") and res["mode"] == "CW":
-                    got = log_calls(extract_calls(res["text"]), STATE["band"],
+                    got = log_calls(extract_calls(res["text"], eye=res.get("eye_q", 0.0)), STATE["band"],
                                     STATE["center_khz"], snr)
                     if got:
                         res["new_calls"] = got         # log_calls returns a list of call strings
@@ -666,7 +765,7 @@ class H(BaseHTTPRequestHandler):
             with _lock:
                 self._send(json.dumps({**{k: STATE[k] for k in
                     ("center_khz", "tune_khz", "band", "mode", "ifgr", "running",
-                     "lock", "err", "chlock")}, "span": SPAN_KHZ,
+                     "lock", "err", "chlock", "cw_filter_hz")}, "span": SPAN_KHZ,
                     "decode": dict(DECODE), "bands": BANDS, "modes": MODES,
                     "transcript": list(TRANSCRIPT)[-14:],
                     "smeter": round(max(0, (SPEC["peak_db"] - SPEC["noise_db"])), 1)}))
@@ -686,6 +785,15 @@ class H(BaseHTTPRequestHandler):
             if "running" in q:
                 STATE["running"] = q["running"][0] == "1"
             self._send(json.dumps({"ok": True}))
+        elif u.path == "/cwfilter":            # CW filter half-width: wide/400/250/150 (±Hz)
+            try:
+                hz = q.get("hz", ["400"])[0]
+                v = 0 if hz in ("wide", "0") else int(hz)
+                if v in CW_FILTER_CHOICES:
+                    STATE["cw_filter_hz"] = v
+            except ValueError:
+                pass
+            self._send(json.dumps({"ok": True, "cw_filter_hz": STATE["cw_filter_hz"]}))
         elif u.path == "/autotune":
             # jump the cursor to the best COPYABLE CW (highest eye-opening), not the
             # loudest carrier (which is usually FT8/data). Falls back to strongest
@@ -718,8 +826,8 @@ class H(BaseHTTPRequestHandler):
                     if iq is not None:
                         for s in sorted(detect_signals(), key=lambda x: -x["snr"])[:6]:
                             try:
-                                env, aud = envelope_locked(iq, (s["khz"] - ctr) * 1000.0)
-                                eye = cw_quality.eye_opening(env)[0]
+                                env, aud = envelope_locked(iq, (s["khz"] - ctr) * 1000.0, bw=400)
+                                eye = cw_quality.eye_opening(env)[0]   # scan judged at the proven ±400 (independent of user's filter pick)
                                 best_eye = max(best_eye, eye)
                                 if eye >= cw_quality.Q_READABLE:
                                     cwc += 1
@@ -875,6 +983,7 @@ button.mode.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .scanb:hover{background:#22335a}.scanb:disabled{opacity:.6;cursor:wait}
 .listen{width:100%;padding:9px;font-size:13px;font-weight:700}.listen.on{background:var(--acc2);color:#1a0409;border-color:var(--acc2)}
 .lockb{width:100%;padding:9px;font-size:13px;font-weight:700}.lockb.on{background:var(--warn);color:#1a1204;border-color:var(--warn)}
+.fbtn{flex:1;font-size:12px;padding:7px 4px}.fbtn.on{background:#123c49;color:#8fe0f0;border-color:#2e7a8f;font-weight:700}
 .siglist{background:#000;border:1px solid var(--hair);border-radius:8px;max-height:150px;overflow-y:auto}
 .sig{display:flex;align-items:center;gap:8px;padding:5px 9px;font-size:12px;cursor:pointer;border-bottom:1px solid #0b141c}
 .sig:last-child{border-bottom:none}.sig:hover{background:#0b141c}.sig.on{background:rgba(46,230,200,.12);color:var(--acc)}
@@ -926,6 +1035,13 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
       <div class=siglist id=siglist></div>
     </div>
     <button class=listen id=listenb onclick=togListen()>&#9654; LISTEN (live audio)</button>
+    <div class=lbl style="margin-top:6px" title="Narrow the receiver around the tuned signal — rejects neighbouring CW (decode + audio)">CW FILTER &plusmn;Hz</div>
+    <div style="display:flex;gap:5px">
+      <button class=fbtn id=fb0 onclick=setFilt(0)>WIDE</button>
+      <button class=fbtn id=fb400 onclick=setFilt(400)>400</button>
+      <button class=fbtn id=fb250 onclick=setFilt(250)>250</button>
+      <button class=fbtn id=fb150 onclick=setFilt(150)>150</button>
+    </div>
     <audio id=au></audio>
     <div class=dial>
       <div class=lbl>Copy Quality &mdash; eye-opening (the CW "MER")</div>
@@ -1021,14 +1137,17 @@ async function refresh(){
   $('eyebar').style.width=Math.min(100,Math.max(0,(eq-1.5)/(4.0-1.5)*100))+'%';
   $('eyebar').style.background=vc;
   $('conf').textContent=Math.round((d.conf||0)*100)+'%';
-  $('route').textContent=d.route?({neural:'🧠 neural AI',mf:'matched-filter (fading)',classic:'classic'}[d.route]||d.route):'—';
+  $('route').textContent=(d.route?({neural:'🧠 neural AI',mf:'matched-filter (fading)',mf2:'matched-filter',classic:'classic'}[d.route]||d.route):'—')+(d.lock_eye>0?(' · lock eye '+d.lock_eye.toFixed(1)):'');
+  const fhz=(ST.cw_filter_hz===undefined)?400:ST.cw_filter_hz;
+  for(const v of [0,400,250,150]){const b=$('fb'+v);if(b)b.classList.toggle('on',fhz===v);}
   $('wpm').textContent=d.wpm?d.wpm.toFixed(1):'—';
   $('sm').textContent=(ST.smeter||0).toFixed(0)+' dB';$('smbar').style.width=Math.min(100,(ST.smeter||0)*2.2)+'%';
   $('declbl').textContent=ST.mode==='CW'?'Live Morse transcript':ST.mode+' decode';
   const xs=$('xscript');
   if(ST.mode==='CW'){
     const tr=ST.transcript||[];    // rolling history so intermittent copy accumulates & stays visible
-    xs.innerHTML = tr.length ? tr.map(x=>`<span class=xline>${x.text} </span>`).join('')
+    const mstyle='display:block;font-family:monospace;opacity:.5;font-size:.8em;letter-spacing:2px;margin-bottom:4px';
+    xs.innerHTML = tr.length ? tr.map(x=>`<span class=xline>${x.text}${(ST.showmorse!==false&&x.morse)?`<span style="${mstyle}">${x.morse}</span>`:''} </span>`).join('')
                   : (d.text?`<span class=xline>${d.text}</span>`:'<div class=sub>…listening for CW…</div>');
     xs.scrollTop=xs.scrollHeight;
   } else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
@@ -1075,6 +1194,7 @@ async function advise(){let s;try{s=await api('/advisor');}catch(e){return;}
 async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
 async function togLock(){await api('/lock?on='+(ST.chlock?0:1));refresh();}
 async function tune(khz){await api('/tune?khz='+khz);refresh();}
+async function setFilt(hz){await api('/cwfilter?hz='+hz);refresh();}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
   const cur=s.tune!==undefined?s.tune:c;
@@ -1153,6 +1273,13 @@ async function draw(){
     if(!vis){                                        // cursor panned off-view -> edge arrow pointing to it (click to recenter)
       sx.fillStyle=col;sx.font='bold 15px system-ui';sx.textAlign=cx<0?'left':'right';
       sx.fillText((cx<0?'◀ cursor':'cursor ▶'),cx<0?6:w-6,30);sx.textAlign='left';}}
+  // CW-filter passband shading ±bw around the cursor — SEE what the radio hears
+  const bwhz=ST.cw_filter_hz;
+  if(bwhz&&tk&&VS){const bk=bwhz/1000;
+    const x1=(tk-bk-(VC-VS/2))/VS*w, x2=(tk+bk-(VC-VS/2))/VS*w;
+    if(x2>0&&x1<w){const a1=Math.max(0,x1),a2=Math.min(w,x2);
+      sx.fillStyle='rgba(255,216,74,.09)';sx.fillRect(a1,0,a2-a1,h);
+      sx.strokeStyle='rgba(255,216,74,.35)';sx.strokeRect(a1+.5,.5,a2-a1-1,h-1);}}
   // frequency axis — the kHz labels visibly compress as you zoom (clear feedback)
   sx.fillStyle='rgba(150,185,205,.75)';sx.font='10px ui-monospace,monospace';sx.textAlign='center';
   for(let i=0;i<=4;i++){const fk=VC-VS/2+i/4*VS,x=Math.max(24,Math.min(w-24,i/4*w));
