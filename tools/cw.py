@@ -44,6 +44,36 @@ def envelope(iq, fs, off_hz, aud=8000):
     return np.convolve(env, np.ones(k, np.float32) / k, mode="same"), aud
 
 
+def envelope_coherent(iq, fs, off_hz, aud=8000, coh_ms=12.0,
+                      search_hz=0.0, bin_hz=8.0):
+    """Coherent front-end (EXP-13): integrate the COMPLEX baseband over a short
+    matched window BEFORE taking magnitude - |sum(x)| instead of the classic
+    sum(|x|). For a phase-stable tone this gains ~sqrt(window) of SNR.
+
+    *** KILLED, kept only for study (exp13_coherent.py). It is a SYNTHETIC-BENCH
+    MIRAGE: on synthetic IQ it crushes incoherent (noise-floor 1.23 -> 2.50), but
+    on REAL captures it collapses (callsign recall 0.257 -> 0.03-0.06 at EVERY
+    window 2-12 ms). Real HF CW has phase noise, drift and QSB that decorrelate
+    coherent integration; the incoherent envelope's phase-blindness is a FEATURE.
+    DO NOT wire this into decode_env_* / the panel - it destroys real copy. ***"""
+    from scipy.signal import resample_poly
+    from math import gcd
+    n = np.arange(len(iq), dtype=np.float64)
+    x = iq * np.exp(-2j * np.pi * off_hz / fs * n)
+    g = gcd(int(aud), int(fs))
+    x = resample_poly(x, int(aud) // g, int(fs) // g).astype(np.complex64)
+    k = max(1, int(aud * coh_ms / 1000.0))
+    box = np.ones(k, np.float32) / k
+    m = np.arange(len(x), dtype=np.float64)
+    nb = int(search_hz // bin_hz) if search_hz > 0 else 0
+    best = None
+    for b in range(-nb, nb + 1):
+        xb = x if b == 0 else x * np.exp(-2j * np.pi * (b * bin_hz) / aud * m)
+        mag = np.abs(np.convolve(xb, box, mode="same")).astype(np.float32)
+        best = mag if best is None else np.maximum(best, mag)
+    return best, aud
+
+
 def envelope2(iq, fs, off_hz, aud=8000, bw_hz=150):
     """EXP H10: like envelope() but with a NARROW complex low-pass around DC BEFORE
     the magnitude detector. envelope() detects over the full +/-aud/2 (~4 kHz) noise
