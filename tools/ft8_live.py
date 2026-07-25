@@ -35,13 +35,15 @@ _CALL = re.compile(r"\b([A-Z0-9]{1,3}\d[A-Z]{1,4})\b")
 _GRID = re.compile(r"\b([A-R]{2}\d{2})\b")
 
 
-def iq_to_wav(iq, khz, wav_path):
-    """Mix the FT8 dial to baseband, USB-filter to 12 kHz mono wav."""
-    off = DIAL_OFF.get(khz, 49_000.0)
+def iq_to_wav(iq, khz, wav_path, off_hz=None, fs=FS):
+    """Mix the FT8 dial to baseband, USB-filter to 12 kHz mono wav. `off_hz`
+    overrides the filename-band DIAL_OFF table (the panel computes its own offset
+    from a flexible center); `fs` overrides the source sample rate."""
+    off = off_hz if off_hz is not None else DIAL_OFF.get(khz, 49_000.0)
     n = np.arange(len(iq), dtype=np.float64)
-    x = iq * np.exp(-2j * np.pi * off / FS * n)
-    taps = firwin(401, 3300.0 / (FS / 2)).astype(np.float32)
-    audio = resample_poly(lfilter(taps, 1.0, x), AUD, int(FS)).real.astype(np.float32)
+    x = iq * np.exp(-2j * np.pi * off / fs * n)
+    taps = firwin(401, 3300.0 / (fs / 2)).astype(np.float32)
+    audio = resample_poly(lfilter(taps, 1.0, x), AUD, int(fs)).real.astype(np.float32)
     audio = audio / (np.max(np.abs(audio)) + 1e-9) * 0.7
     with wave.open(str(wav_path), "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(AUD)

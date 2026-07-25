@@ -373,7 +373,70 @@ def decode_cw(iq):
             "elements": info.get("elements", 0), "offset_hz": round(off, 1), "hint": hint}
 
 
-DECODERS = {"CW": decode_cw}
+# FT8 dial frequencies (kHz) per band — the standard sub-band the whole world
+# transmits on. The panel mixes THIS onto baseband, unlike the classic CW cursor.
+FT8_DIAL_KHZ = {"160m": 1840.0, "80m": 3573.0, "60m": 5357.0, "40m": 7074.0,
+                "30m": 10136.0, "20m": 14074.0, "17m": 18100.0, "15m": 21074.0,
+                "12m": 24915.0, "10m": 28074.0, "6m": 50313.0}
+_FT8_LAST = {"slot": None}      # slot-dedupe: append a transcript line once per slot
+
+
+def decode_ft8(iq):
+    """FT8 via the jt9 engine-adapter (ft8_live.py). FT8 transmissions start on
+    :00/:15/:30/:45 UTC, so we cut the 15 s window aligned to the last completed
+    slot that fits in the ring (jt9's own +/-2.4 s dt search covers the residual);
+    mix the band's FT8 dial to baseband; run jt9; return the decodes. Only emits a
+    transcript line ONCE per slot (the decoder thread re-runs faster than 15 s)."""
+    import datetime
+    import ft8_live
+    band = STATE.get("band", "20m")
+    dial = FT8_DIAL_KHZ.get(band)
+    empty = {"text": "", "q": 0.0, "conf": 0.0, "wpm": 0, "n": 0,
+             "decodes": [], "lines": [], "calls": [], "grids": []}
+    if dial is None:
+        return {**empty, "offset_hz": 0,
+                "hint": f"no FT8 dial for {band} — try 20m/40m/30m/…"}
+    off = (dial - STATE["center_khz"]) * 1000.0          # Hz: capture center -> FT8 dial
+    fs = FS
+    total_s = len(iq) / fs
+    now = datetime.datetime.now(datetime.timezone.utc)
+    into = (now.second % 15) + now.microsecond / 1e6     # seconds into the current slot
+    start_s = total_s - into - 15.0                      # window start, seconds from buffer head
+    if start_s >= 0:
+        a = int(start_s * fs)
+        seg, aligned = iq[a:a + int(15 * fs)], True
+    else:
+        seg, aligned = iq[-int(15 * fs):], False         # fallback: last 15 s
+    if len(seg) < int(14 * fs):
+        return {**empty, "offset_hz": round(off),
+                "hint": "buffer too short for a 15 s FT8 slot"}
+    slot_key = int((now.timestamp() - into) // 15)
+    new_slot = slot_key != _FT8_LAST["slot"]
+    _FT8_LAST["slot"] = slot_key
+    wav = HERE.parent / "lab" / "_ft8_panel.wav"
+    wav.parent.mkdir(exist_ok=True)
+    ft8_live.iq_to_wav(seg.astype(np.complex64), None, wav, off_hz=off, fs=fs)
+    recs, err = ft8_live.decode_wav(wav)
+    if err:
+        return {**empty, "offset_hz": round(off), "hint": err[:80]}
+    calls, grids = [], []
+    for r in recs:
+        for c in r.get("calls", []):
+            if c not in calls:
+                calls.append(c)
+        if r.get("grid") and r["grid"] not in grids:
+            grids.append(r["grid"])
+    lines = [f"{r['snr']:+3d} {r['msg']}" for r in recs[:12]]
+    text = " / ".join(r["msg"] for r in recs[:8]) if (recs and new_slot) else ""
+    hint = "" if recs else "no FT8 decodes this slot (need a live signal on the dial)"
+    return {"text": text, "q": 1.0 if recs else 0.0,
+            "conf": round(min(1.0, len(recs) / 5.0), 2), "wpm": 0,
+            "offset_hz": round(off), "n": len(recs), "decodes": recs[:12],
+            "lines": lines, "calls": calls, "grids": grids,
+            "aligned": aligned, "hint": hint}
+
+
+DECODERS = {"CW": decode_cw, "FT8": decode_ft8}
 
 # ── logbook: harvest callsigns like a real ham, and score them ──
 LOGFILE = HERE.parent / "lab" / "cw_log.jsonl"
@@ -653,6 +716,14 @@ class Decoder(threading.Thread):
                                     STATE["center_khz"], snr)
                     if got:
                         res["new_calls"] = got         # log_calls returns a list of call strings
+                        with _lock:
+                            DECODE["new_calls"] = got
+                elif res.get("text") and res["mode"] == "FT8" and res.get("calls"):
+                    # FT8 carries verified callsigns directly (structured) - log them
+                    # once per slot (text is only set on a new slot, so this dedupes).
+                    got = log_calls(res["calls"], STATE["band"], STATE["center_khz"], snr)
+                    if got:
+                        res["new_calls"] = got
                         with _lock:
                             DECODE["new_calls"] = got
             except Exception as e:

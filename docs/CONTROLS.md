@@ -119,6 +119,9 @@ flowchart LR
   DEC --> XS["transcript: English + Morse tokens<br/>(dits/dashes + per-letter confidence q)"]
   DEC --> LOG["extract_calls (CONSENSUS-gated:<br/>agreeing repeats, or open eye for DE/CQ)"]
   LOG --> VER["Verifier thread<br/>hamdb.verify -&gt; LOGBOOK (points)"]
+  RING --> FT8N["Decoder thread - FT8 mode<br/>slot-align 15s -&gt; mix band FT8 dial -&gt;<br/>iq_to_wav -&gt; jt9 (WSJT-X adapter) -&gt; decodes"]
+  FT8N --> XS
+  FT8N --> LOG
 
   subgraph SRV["panel HTTP server :8647"]
     EP["/spectrum /state /tune /set /cwfilter<br/>/signals /log /advisor /lock /autotune /scanbands /cw_audio.wav"]
@@ -152,6 +155,11 @@ flowchart LR
   thread drops samples).
 - Decoder is **classic `decode_env_auto` + `cw_lm`** (reads real callsigns 13/13);
   the neural `cw_ai` is opt-in and currently loses to classic on real signals.
+- **FT8 mode** (`DECODERS["FT8"]` -> `decode_ft8`) slot-aligns a 15 s window, mixes
+  the band's FT8 dial to baseband, and runs the **jt9 (WSJT-X) engine-adapter**
+  (`ft8_live.py`) - we wrap the world-class decoder, never reimplement it. Decoded
+  callsigns feed the same LOGBOOK. New mode == new decoder function in `DECODERS`
+  (validated: 13 decodes/slot on a real 20 m capture, live SDR validation pending).
 - `cw_quality` eye-opening is the honest copyability metric (pre-decode), feeding
   both the classifier tags and the Copy-Quality dial.
 - Panel and harvester are **single-tenant on the SDR** — run one at a time.
