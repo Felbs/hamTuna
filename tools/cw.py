@@ -44,6 +44,28 @@ def envelope(iq, fs, off_hz, aud=8000):
     return np.convolve(env, np.ones(k, np.float32) / k, mode="same"), aud
 
 
+def envelope2(iq, fs, off_hz, aud=8000, bw_hz=150):
+    """EXP H10: like envelope() but with a NARROW complex low-pass around DC BEFORE
+    the magnitude detector. envelope() detects over the full +/-aud/2 (~4 kHz) noise
+    bandwidth; a CW signal is only ~100-150 Hz wide, so band-limiting to +/-bw_hz
+    cuts noise power by ~10*log10((aud/2)/bw_hz) (~14 dB at 150 Hz) before |x| - the
+    classic weak-CW narrow-filter SNR win. Too-narrow smears fast dits, so bw is
+    swept. Same (env, aud) contract as envelope()."""
+    from scipy.signal import resample_poly, firwin
+    from math import gcd
+    n = np.arange(len(iq), dtype=np.float64)
+    x = iq * np.exp(-2j * np.pi * off_hz / fs * n)
+    g = gcd(int(aud), int(fs))
+    x = resample_poly(x, int(aud) // g, int(fs) // g).astype(np.complex64)
+    if bw_hz and bw_hz < aud / 2:
+        ntaps = int(np.clip(aud / bw_hz, 21, 301)) | 1        # odd; ~1 cycle of bw
+        taps = firwin(ntaps, bw_hz / (aud / 2)).astype(np.float32)
+        x = np.convolve(x, taps, mode="same").astype(np.complex64)   # complex LP around DC
+    env = np.abs(x).astype(np.float32)
+    k = max(1, int(aud * 0.008))          # 8 ms smoother
+    return np.convolve(env, np.ones(k, np.float32) / k, mode="same"), aud
+
+
 def _gap_boundaries(off_runs, dit):
     """Adaptive intra/letter and letter/word gap boundaries via 3-means on the
     internal gaps. Fixed 2*dit / 5*dit thresholds break under FARNSWORTH spacing
@@ -86,26 +108,97 @@ def _runs_to_text(runs, aud):
     # gap boundaries adapt to the stream's own spacing (Farnsworth-safe)
     off_runs = [ln for i, (s, ln) in enumerate(runs) if not s and 0 < i < len(runs) - 1]
     lb, wb = _gap_boundaries(off_runs, dit)
-    text = []
-    sym = ""
+    # collect per-letter Morse + a per-element confidence (distance of each ON run
+    # from the dit/dah decision line, normalized) so the panel can show the
+    # dits-and-dashes alongside the English (educational) and flag shaky elements.
+    text, tokens = [], []
+    sym, conf = "", []
+
+    def _emit():
+        if not sym:
+            return
+        text.append(MORSE.get(sym, "?"))
+        # letter quality = 1 - the WORST element's ambiguity (1.0 clean/on a cluster
+        # center, ->0 when an element straddles the dit/dah line). Panel can dim
+        # low-q letters so you SEE where the copy got shaky.
+        tokens.append({"m": sym, "c": MORSE.get(sym, "?"),
+                       "q": round(max(0.0, 1.0 - max(conf)), 2) if conf else 1.0})
+        conf.clear()
+
     for s, ln in runs:
         if s:                              # tone
             sym += "-" if ln > 2 * dit else "."
+            # element ambiguity = normalized distance to the nearer cluster center
+            # (0 = clean dit/dah, ~1 = right on the 2*dit boundary)
+            conf.append(float(min(abs(ln - dit), abs(ln - 3 * dit)) / max(dit, 1e-9)))
         else:                              # gap
             if ln > wb:                    # word gap
-                if sym:
-                    text.append(MORSE.get(sym, "?"))
+                _emit()
                 text.append(" ")
+                tokens.append({"m": "/", "c": " ", "q": 1.0})
                 sym = ""
             elif ln > lb:                  # letter gap
-                if sym:
-                    text.append(MORSE.get(sym, "?"))
-                    sym = ""
-    if sym:
-        text.append(MORSE.get(sym, "?"))
+                _emit()
+                sym = ""
+    _emit()
     return "".join(text).strip(), {"dit_ms": round(1000 * dit / aud, 1),
                                    "wpm": round(1.2 / (dit / aud), 1),
-                                   "elements": len(on_runs)}
+                                   "elements": len(on_runs),
+                                   "morse": " ".join(t["m"] for t in tokens),
+                                   "tokens": tokens}
+
+
+def _runs_to_text2(runs, aud):
+    """EXP H5 (graceful degradation): like _runs_to_text but emits '?' for a LETTER
+    only when a dit/dah call is genuinely ambiguous - an ON run straddling the
+    2*dit boundary AND resolving it both ways yields DIFFERENT valid letters.
+    Clean copy has no straddling elements -> zero spurious '?'; weak copy degrades
+    to '?' (honest 'I missed that') instead of a confident WRONG letter."""
+    on_runs = [ln for s, ln in runs if s]
+    if len(on_runs) < 3:
+        return "", {"runs": len(runs)}
+    o = np.array(on_runs, float)
+    med = np.median(o)
+    dit = np.median(o[o <= med]) or med
+    off_runs = [ln for i, (s, ln) in enumerate(runs) if not s and 0 < i < len(runs) - 1]
+    lb, wb = _gap_boundaries(off_runs, dit)
+    lo_a, hi_a = 1.5 * dit, 2.5 * dit          # ambiguity band around the 2*dit boundary
+
+    def _flush(elems):
+        if not elems:
+            return ""
+        amb = [i for i, (_, a) in enumerate(elems) if a]
+        cands = set()
+        if len(amb) <= 3:                       # enumerate flips of ambiguous elements
+            for mask in range(1 << len(amb)):
+                chars = [c for c, _ in elems]
+                for b, i in enumerate(amb):
+                    if mask & (1 << b):
+                        chars[i] = "-" if chars[i] == "." else "."
+                lt = MORSE.get("".join(chars))
+                if lt:
+                    cands.add(lt)
+        else:
+            lt = MORSE.get("".join(c for c, _ in elems))
+            cands = {lt} if lt else set()
+        return next(iter(cands)) if len(cands) == 1 else "?"
+
+    text, elems = [], []
+    for s, ln in runs:
+        if s:
+            elems.append(("-" if ln > 2 * dit else ".", lo_a < ln < hi_a))
+        elif ln > wb:                           # word gap
+            if elems:
+                text.append(_flush(elems))
+            text.append(" "); elems = []
+        elif ln > lb:                           # letter gap
+            if elems:
+                text.append(_flush(elems)); elems = []
+    if elems:
+        text.append(_flush(elems))
+    return "".join(text).strip(), {"dit_ms": round(1000 * dit / aud, 1),
+                                   "wpm": round(1.2 / (dit / aud), 1),
+                                   "elements": len(on_runs), "graceful": True}
 
 
 def _rle(on):
@@ -227,13 +320,197 @@ def decode_env_auto(env, aud):
     exactly the 'loud but eye closed' case where the global threshold fails.
     Best-of-both with no regression on clean copy."""
     Q, fade = _eye_and_fade(env)
-    if Q < 3.5 and fade > 6.0:              # fading + eye closing -> matched filter
-        txt, info = decode_env_mf(env, aud)
-        info["route"] = "mf"
+    if Q >= 4.5 and fade <= 4.0:            # pristine open eye -> classic (proven best on clean)
+        txt, info = decode_env(env, aud)
+        info["route"] = "classic"
         return txt, info
-    txt, info = decode_env(env, aud)
-    info["route"] = "classic"
+    # weak / fading / eye-closing / dit-collapsing -> matched filter + robust dit.
+    # Campaign 2 (lab/science_log.md): this recovers copy where the global
+    # threshold collapses to stuck-'T' garbage ('KEEP DOING WHAT' vs 'T T T T'),
+    # and nearly doubles the synthetic copy-floor (0.475 -> 0.947), with the clean
+    # open-eye case still routed to classic above so KI4XH-grade copy is untouched.
+    txt, info = decode_env_mf2(env, aud)    # resolved at call time (defined below)
+    info["route"] = "mf2"
     return txt, info
+
+
+# ---- EXPERIMENTAL (Campaign 2: "copy the weakest Morse") ------------------
+# Opt-in variants benched in weak_bench.py. Production (decode_env_auto) stays
+# unchanged until a variant WINS the bench (SNR floor >= baseline AND fade floor
+# up AND real recall == 13/13 AND test_cw.py green). See lab/science_log.md.
+
+def _robust_dit(on_runs, aud):
+    """Dit length that resists collapse to noise-chatter. Drop sub-8 ms runs (no
+    real dit is that short at <=50 wpm) before clustering the ON runs, then take
+    the shorter cluster; floor at aud*0.015 (~50 wpm) so a chattery envelope
+    can't drive dit to ~2 samples (the wpm=4800 collapse artifact)."""
+    o = np.array([r for r in on_runs if r >= aud * 0.008], float)   # 8 ms chatter floor
+    if len(o) < 3:
+        o = np.array(on_runs, float)
+    if len(o) == 0:
+        return aud * 0.06
+    med = np.median(o)
+    dit = np.median(o[o <= med]) or med
+    return float(np.clip(dit, aud * 0.015, aud * 0.30))
+
+
+def _mf_slice_decode(env, aud, ndit, lo, hi, rt=None):
+    """Shared matched-filter back end: integrate over ndit, fade-track the slice
+    level per ~0.6s block with a gentle noise gate + hysteresis, RLE -> text.
+    Used by decode_env_mf2 (single dit estimate) and decode_env_mf3 (dit search).
+    rt = run-length->text function (default _runs_to_text; _runs_to_text2 for H5
+    graceful '?' degradation)."""
+    rt = rt or _runs_to_text
+    mf = np.convolve(env, np.ones(ndit, np.float32) / ndit, mode="same")
+    blk = max(int(0.6 * aud), 4 * ndit)
+    gfloor = np.percentile(mf, 60)
+    centers, levels, margins = [], [], []
+    for b in range(0, len(mf), blk):
+        seg = mf[b:b + blk]
+        if len(seg) < ndit:
+            continue
+        blo, bhi = np.percentile(seg, 25), np.percentile(seg, 92)
+        centers.append(b + len(seg) / 2)
+        if bhi < gfloor and bhi < 1.35 * blo:          # BOTH noise-floor AND flat -> suppress
+            levels.append(bhi * 5 + 1e-6); margins.append(0.0)
+        else:                                          # present (even if weak) -> slice lower
+            levels.append(blo + 0.45 * (bhi - blo)); margins.append(0.45 * (bhi - blo))
+    if len(centers) < 2:
+        return rt(_rle(mf > (lo + 0.4 * (hi - lo))), aud), mf
+    thr = np.interp(np.arange(len(mf)), centers, levels)
+    marg = np.interp(np.arange(len(mf)), centers, margins)
+    hi_t = thr + 0.20 * marg
+    lo_t = thr - 0.20 * marg
+    on = np.empty(len(mf), bool)
+    state = mf[0] > thr[0]
+    for i in range(len(mf)):
+        if state and mf[i] < lo_t[i]:
+            state = False
+        elif not state and mf[i] > hi_t[i]:
+            state = True
+        on[i] = state
+    return rt(_rle(on), aud), mf
+
+
+def decode_env_mf2q(env, aud):
+    """EXP H5: decode_env_mf2 with the graceful '?' back end (_runs_to_text2) -
+    ambiguous dit/dah calls degrade to '?' instead of a confident wrong letter."""
+    if len(env) < aud // 2:
+        return decode_env(env, aud)
+    hi, lo = np.percentile(env, 90), np.percentile(env, 25)
+    if hi - lo < 1e-6:
+        return "", {}
+    on0 = env > (lo + 0.4 * (hi - lo))
+    on0_runs = [ln for s, ln in _rle(on0) if s]
+    if len(on0_runs) < 3:
+        return "", {"runs": len(on0_runs)}
+    ndit = int(np.clip(_robust_dit(on0_runs, aud), aud * 0.015, aud * 0.3))
+    (txt, info), _ = _mf_slice_decode(env, aud, ndit, lo, hi, rt=_runs_to_text2)
+    info["mf"] = "2q"
+    return txt, info
+
+
+def decode_env_mf2(env, aud):
+    """EXP: matched-filter decoder with a robust dit and a GENTLER noise gate.
+
+    Two changes vs decode_env_mf, targeting its two baseline failures:
+      * robust dit (sizes the matched filter) so a chattery/fast envelope can't
+        collapse the width to noise-chatter;
+      * the per-block noise gate only fully suppresses a block that is BOTH below
+        the global signal floor AND flat (bhi < 1.35*blo). decode_env_mf killed
+        any block with bhi<1.6*blo, so on a globally low-eye fading real capture
+        it suppressed real signal blocks and returned EMPTY (0/13 real recall).
+    """
+    if len(env) < aud // 2:
+        return decode_env(env, aud)
+    hi, lo = np.percentile(env, 90), np.percentile(env, 25)
+    if hi - lo < 1e-6:
+        return "", {}
+    on0 = env > (lo + 0.4 * (hi - lo))
+    on0_runs = [ln for s, ln in _rle(on0) if s]
+    if len(on0_runs) < 3:
+        return "", {"runs": len(on0_runs)}
+    ndit = int(np.clip(_robust_dit(on0_runs, aud), aud * 0.015, aud * 0.3))
+    (txt, info), _ = _mf_slice_decode(env, aud, ndit, lo, hi)
+    info["mf"] = 2
+    return txt, info
+
+
+def decode_env_mf3(env, aud):
+    """EXP H4 (NEGATIVE RESULT - NOT routed into production; kept opt-in so the
+    loop doesn't re-try the same idea). Matched-filter with a per-window DIT-WIDTH
+    SEARCH. Two selection criteria both FAILED the gate: eye-max improved the synth
+    copy-floor (1.09 vs mf2's 0.947) but over-smoothed and garbled a real fast fist
+    ('KEEP DOING WHAT' -> 'UEEP DDTND'); readability-scoring destroyed CLEAN copy
+    (KI4XH -> 'MI TKT TTTKTTT', clean CER 0.26). LESSON: a per-window width search
+    is unstable - one GLOBAL robust-dit estimate (mf2) is better-behaved across
+    clean+weak+fading. The frontier is a better DETECTOR/timing model, not width
+    re-selection. See lab/science_log.md EXP-2."""
+    if len(env) < aud // 2:
+        return decode_env(env, aud)
+    hi, lo = np.percentile(env, 90), np.percentile(env, 25)
+    if hi - lo < 1e-6:
+        return "", {}
+    on0 = env > (lo + 0.4 * (hi - lo))
+    on0_runs = [ln for s, ln in _rle(on0) if s]
+    if len(on0_runs) < 3:
+        return "", {"runs": len(on0_runs)}
+    d0 = _robust_dit(on0_runs, aud)
+    # score each candidate width by decoded READABILITY (real letters minus '?'
+    # penalty), NOT eye-opening: maximizing eye over-smooths and garbles fast real
+    # fists ('KEEP DOING WHAT' -> 'UEEP DDTND'). Tie-break toward the NARROWER
+    # width (less smoothing preserves fast elements).
+    best = None
+    for mult in (0.6, 0.8, 1.0, 1.25, 1.5):
+        ndit = int(np.clip(d0 * mult, aud * 0.015, aud * 0.3))
+        (txt, info), _ = _mf_slice_decode(env, aud, ndit, lo, hi)
+        letters = sum(1 for c in txt if c.isalnum())
+        score = letters - 2 * txt.count("?")            # readable copy, penalize junk
+        if best is None or score > best[0] + 1e-9:      # strict > keeps earlier (narrower) on tie
+            best = (score, ndit, txt, info)
+    _, best_ndit, txt, info = best
+    info["mf"] = 3
+    info["ndit"] = best_ndit
+    return txt, info
+
+
+def decode_env_auto2(env, aud):
+    """EXP H8 (WASH - NOT routed into production; kept opt-in). 3-way router adding
+    the HSMM+Viterbi decoder for the weak-but-not-fading case. bayes has the best
+    weak-SNR copy-floor (1.032 vs mf2 0.947, near-zero CER 0.18-0.75) but CANNOT
+    handle fade (0.10); mf2 owns fade (0.443). Ensembling them (classic on pristine
+    eye; mf2 when fading; else keep the more-readable of mf2/bayes with a garbage-
+    volume guard) nets SNR 0.972 / FADE 0.436 - both WITHIN bench sampling noise of
+    mf2, at 2x compute (bayes EM+Viterbi is slow for the live panel). VERDICT: not
+    worth promoting as an ensemble. The real lever is bayes's weak-SNR strength;
+    NEXT (H8b) = give the Viterbi front-end proper FADE TRACKING so one fast
+    decoder gets BOTH the 1.03 SNR floor AND >=0.443 fade, then route it directly.
+    See lab/science_log.md EXP-3."""
+    Q, fade = _eye_and_fade(env)
+    if Q >= 4.5 and fade <= 4.0:
+        txt, info = decode_env(env, aud)
+        info["route"] = "classic"
+        return txt, info
+    txt_m, info_m = decode_env_mf2(env, aud)
+    if fade > 2.0:                              # ANY real fade -> the fade-tracker wins
+        info_m["route"] = "mf2"                 # (bayes garbles QSB; threshold set between
+        return txt_m, info_m                    #  no-fade ~0.6dB and QSB-0.6 ~3.7dB synth)
+    try:
+        import cw_bayes
+        txt_b, info_b = cw_bayes.decode_bayes(env, aud, soft=False)
+    except Exception:
+        info_m["route"] = "mf2"
+        return txt_m, info_m
+
+    def _rd(t):
+        return sum(c.isalnum() for c in t) - 3 * t.count("?")
+    # prefer bayes ONLY if it's more readable AND not a garbage-volume blowup
+    # (a mis-routed fade case garbles into long junk that would win on raw count).
+    if _rd(txt_b) > _rd(txt_m) and len(txt_b) <= 1.4 * len(txt_m) + 6:
+        info_b["route"] = "bayes"
+        return txt_b, info_b
+    info_m["route"] = "mf2"
+    return txt_m, info_m
 
 
 def find_offset(iq, fs, search=15000):

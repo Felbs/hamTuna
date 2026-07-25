@@ -31,15 +31,32 @@ import hamdb
 
 FS = 250_000.0
 OUT = HERE.parent / "lab" / "cw_harvest"
-EYE_TRIP = 2.0          # trip lower so we grab the FULL quality range (rough -> clean),
-#                         not just clean CW — we want both tiers for training/robustness
-HANG_S = 8.0            # keep recording this long after the eye last closed
-MAX_REC_S = 120.0       # cap a single recording (250 kHz cs16 = ~1 MB/s -> ~120 MB)
+# BIG-CORPUS MODE (2026-07-24, user: "we have a terabyte, save everything, feed it
+# to Fable 5 as training data"). Capture LONGER (whole QSOs -> context + repeated
+# callsigns for the soft-decision / neural work) and grab more of the quality range.
+EYE_TRIP = 1.8          # a touch lower -> catch more marginal CW for training diversity
+#                         (still above pure noise so we don't fill disk with static)
+HANG_S = 20.0           # keep recording through longer gaps so a QSO isn't split
+MAX_REC_S = 600.0       # up to 10 min per capture (250 kHz cs16 ~1 MB/s -> ~600 MB max)
 CHUNK_S = 4.0           # monitor/record granularity
+MIN_FREE_FRAC = 0.10    # FILL THE DISK TO 90% (user: capture all the Morse we can;
+#                         we only ever record when the eye is open, so it's all real
+#                         CW, not static). Stop taking NEW captures at 10% free so the
+#                         OS/drive don't choke; existing captures always finish.
 
 
 def _gmt():
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def _disk():
+    """(free_GB, free_fraction). If we can't tell, report 'plenty' so we never block."""
+    import shutil
+    try:
+        u = shutil.disk_usage(str(OUT.anchor or OUT))
+        return u.free / 1e9, u.free / u.total
+    except Exception:
+        return 1e9, 1.0
 
 
 def best_eye(iq, khz_center):
@@ -137,9 +154,13 @@ def run(khz, hours, antenna, scan=True):
             eye, off = best_eye(iq, cur)
             now = time.time()
             if not recording:
-                if eye >= EYE_TRIP:                       # TRIP - CW found
+                free_gb, free_frac = _disk()
+                if eye >= EYE_TRIP and free_frac >= MIN_FREE_FRAC:   # TRIP - CW found
                     recording, buf, last_open = True, [iq], now
-                    print(f"[harvest] TRIP eye={eye:.1f} @ {cur} kHz - recording...", flush=True)
+                    print(f"[harvest] TRIP eye={eye:.1f} @ {cur} kHz - recording... "
+                          f"(disk {free_gb:.0f} GB / {free_frac*100:.0f}% free)", flush=True)
+                elif eye >= EYE_TRIP:                     # would trip but disk ~90% full
+                    print(f"[harvest] DISK 90% FULL ({free_gb:.0f} GB free) - skipping capture", flush=True)
                 elif scan:                                # keep scanning the bands
                     dwell += 1
                     if dwell >= DWELL_CHUNKS:

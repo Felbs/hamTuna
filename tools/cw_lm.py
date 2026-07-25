@@ -147,6 +147,107 @@ def _repair(tok):
     return best if best in LEX_LOGP else tok
 
 
+def _letter_alts(m, q, qthresh=0.72):
+    """Candidate letters for one decoded element-string m at confidence q. Clean
+    (q>=thresh): only the decoded letter. Uncertain: also single-element dit<->dah
+    flips that form a valid Morse letter (the ambiguity IS a mark near the 2*dit
+    line, so the true letter is one flip away)."""
+    import cw
+    prim = cw.MORSE.get(m, "?")
+    if q >= qthresh or not m:
+        return [prim]
+    alts = [prim] if prim != "?" else []
+    for i in range(len(m)):
+        mm = m[:i] + ("-" if m[i] == "." else ".") + m[i + 1:]
+        lt = cw.MORSE.get(mm)
+        if lt and lt not in alts:
+            alts.append(lt)
+    return alts or ["?"]
+
+
+def soft_resolve(tokens, qthresh=0.72, max_amb=5):
+    """H13 SOFT-DECISION SYMBOLIC LOCKS: resolve ambiguous (low-q) letters by the
+    CONTEXT they sit in - for each word, pick the letter combination that maximizes
+    ham plausibility (token_logscore: lexicon > callsign/RST > trigram). Locks a
+    shaky mark from the word/callsign it belongs to, not the mark alone (what a human
+    does). Clean letters (q>=qthresh) are NEVER given alternatives, so clean copy
+    cannot regress. tokens = cw decode info['tokens'] = [{m,c,q}, ...]."""
+    import itertools
+    words, cur = [], []
+    for t in tokens:
+        if t.get("c") == " " or t.get("m") == "/":
+            if cur:
+                words.append(cur); cur = []
+        else:
+            cur.append(_letter_alts(t.get("m", ""), float(t.get("q", 1.0)), qthresh))
+    if cur:
+        words.append(cur)
+    out = []
+    for word in words:
+        amb = [i for i, c in enumerate(word) if len(c) > 1]
+        # ONLY resolve a word with a SINGLE ambiguous letter in otherwise-clean
+        # context - that's the case that works (recover one garbled mark from the
+        # word). Multi-ambiguous words = genuinely weak copy; resolving them just
+        # picks plausible-but-wrong combos (EXP-6 lesson) -> leave as primaries.
+        if len(amb) != 1:
+            out.append("".join(c[0] for c in word)); continue
+        choices = [word[i] if i in amb else [word[i][0]] for i in range(len(word))]
+        best, bestsc = None, None
+        for combo in itertools.product(*choices):
+            cand = "".join(combo)
+            sc = token_logscore(cand)
+            if bestsc is None or sc > bestsc:
+                best, bestsc = cand, sc
+        out.append(best)
+    return " ".join(out)
+
+
+def _callish(tok):
+    """callsign-shaped: has a digit AND letters, length 3-7 (the tokens worth voting
+    - a garbled callsign can't be fixed by context, only by redundancy)."""
+    return (3 <= len(tok) <= 7 and any(c.isdigit() for c in tok)
+            and any(c.isalpha() for c in tok))
+
+
+def _sim(a, b):
+    """position-match fraction over the longer length (quick token similarity)."""
+    if not a or not b:
+        return 0.0
+    m = min(len(a), len(b))
+    return sum(1 for i in range(m) if a[i] == b[i]) / max(len(a), len(b))
+
+
+def _vote(group):
+    """Consensus token from repeats: modal length, then per-position majority."""
+    from collections import Counter
+    L = Counter(len(t) for t in group).most_common(1)[0][0]
+    same = [t for t in group if len(t) == L] or group
+    return "".join(Counter(t[k] for t in same if k < len(t)).most_common(1)[0][0]
+                   for k in range(L))
+
+
+def vote_repeats(text, min_rep=2, sim=0.5):
+    """H11 REPETITION VOTING (the reliable human trick - redundancy, not guessing):
+    hams send a call 2-3x; a garbled repeat is recovered by per-position MAJORITY
+    VOTE across the repeats. Corrects each member to the consensus but KEEPS the
+    count (doesn't collapse). Only fires on callsign-shaped runs (EXP-8: context
+    can't fix callsigns; redundancy can). Non-repeated / non-callsign copy is
+    untouched, so clean copy can't regress."""
+    toks = text.split()
+    out, i = [], 0
+    while i < len(toks):
+        j = i + 1
+        while j < len(toks) and _callish(toks[i]) and _sim(toks[i], toks[j]) >= sim:
+            j += 1
+        group = toks[i:j]
+        if len(group) >= min_rep and _callish(toks[i]):
+            out.extend([_vote(group)] * len(group))    # correct each repeat, keep count
+        else:
+            out.append(toks[i]); j = i + 1
+        i = j
+    return " ".join(out)
+
+
 def rescore(text):
     """Rescore a raw CW decode -> cleaner ham text. Re-segments merged words and
     repairs '?'. Conservative: only rewrites when the LM strongly prefers it."""

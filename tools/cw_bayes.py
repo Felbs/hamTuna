@@ -291,6 +291,74 @@ def decode_bayes(env, aud, soft=False):
                  "segs": len(segs), "bayes": True}
 
 
+def _fade_keystate2(mf, ndit, aud):
+    """Gentle fade-tracked keystate = mf2's WORKING gate (cw._mf_slice_decode)
+    ported in front of the Viterbi. Per ~0.6s block: on/off level + hysteresis;
+    suppress a block only if BOTH below the global signal floor AND flat
+    (bhi<1.35*blo). _fade_keystate used (bhi<1.5*blo OR below floor) -> too
+    aggressive, empties weak-but-present blocks; this keeps them."""
+    blk = max(int(0.6 * aud), 4 * int(ndit))
+    gfloor = np.percentile(mf, 60)
+    centers, levels, margins = [], [], []
+    for b in range(0, len(mf), blk):
+        seg = mf[b:b + blk]
+        if len(seg) < ndit:
+            continue
+        blo, bhi = np.percentile(seg, 25), np.percentile(seg, 92)
+        centers.append(b + len(seg) / 2)
+        if bhi < gfloor and bhi < 1.35 * blo:
+            levels.append(bhi * 5 + 1e-6); margins.append(0.0)
+        else:
+            levels.append(blo + 0.45 * (bhi - blo)); margins.append(0.45 * (bhi - blo))
+    if len(centers) < 2:
+        return mf > np.percentile(mf, 60)
+    idx = np.arange(len(mf))
+    thr = np.interp(idx, centers, levels)
+    marg = np.interp(idx, centers, margins)
+    hi_t, lo_t = thr + 0.2 * marg, thr - 0.2 * marg
+    on = np.empty(len(mf), bool)
+    state = mf[0] > thr[0]
+    for i in range(len(mf)):
+        if state and mf[i] < lo_t[i]:
+            state = False
+        elif not state and mf[i] > hi_t[i]:
+            state = True
+        on[i] = state
+    return on
+
+
+def decode_bayes2(env, aud):
+    """EXP H8b: HSMM+Viterbi on a FADE-TRACKED keystate (same (text,info) contract).
+    decode_bayes(soft=False) has the best weak-SNR floor (1.032) but its static
+    matched-filter threshold sinks under QSB (fade floor 0.10); _soft_keystate
+    (soft=True) is broken. This puts mf2's proven per-block fade-tracker + gentle
+    gate in front of the Viterbi -> the strong timing model WITH fade robustness."""
+    if len(env) < aud // 4:
+        return "", {}
+    hi, lo = np.percentile(env, 90), np.percentile(env, 25)
+    if hi - lo < 1e-6:
+        return "", {}
+    raw_segs = segments(env, lo + 0.45 * (hi - lo))
+    on0 = np.array([d for lvl, d, a in raw_segs if lvl == 1], float)
+    if len(on0) < 3:
+        return "", {"segs": len(raw_segs)}
+    ndit = float(np.median(on0[on0 <= np.median(on0)])) or float(np.median(on0))
+    ndit = float(np.clip(ndit, aud * 0.015, aud * 0.3))
+    mf = _matched(env, ndit)
+    on = _fade_keystate2(mf, ndit, aud)
+    segs = _despeckle(_segments_from_state(on, mf), 0.4 * ndit)
+    if len(segs) < 5:
+        return "", {"segs": len(segs)}
+    on_d = np.array([d for lvl, d, a in segs if lvl == 1], float)
+    if len(on_d) < 3:
+        return "", {"segs": len(segs)}
+    u0 = float(np.median(on_d[on_d <= np.median(on_d)])) or float(np.median(on_d))
+    labels, params = _em_speed(segs, u0)
+    txt = _labels_to_text(segs, labels)
+    wpm = 1.2 / (params["u"] / aud) if params["u"] else 0.0
+    return txt, {"wpm": round(float(wpm), 1), "segs": len(segs), "bayes": 2}
+
+
 # ------------------------------------------------------------------ self-test
 def _synth(text, wpm=20, fs=8000.0, jitter=0.12, noise=0.15, fade=0.0, seed=1):
     """Synthesize a Morse envelope with timing jitter, noise, and optional QSB."""
