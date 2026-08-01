@@ -27,7 +27,12 @@ HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: DEMOD rate only - capture happens at FS_SDR below,
+#                 decimated 125/1024 down to FS right after the grab
+# CAPTURE AT 2.048M, NEVER 250k (law 8/01): the RSPdx 250 kS/s path delivers
+# phase-corrupt, amplitude-suppressed IQ on this box (proven by FM-quieting
+# A/B). Capture high, decimate 125/1024 -> FS in software, once, at the top.
+FS_SDR = 2_048_000.0
 FREQ = 144.390e6
 AUD = 48_000.0
 BAUD = 1200.0
@@ -280,7 +285,7 @@ def cmd_capture(args):
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
     sdr = SoapySDR.Device("driver=sdrplay")
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS)
+    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
     sdr.setFrequency(SOAPY_SDR_RX, 0, FREQ)
     try:
         sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
@@ -296,7 +301,7 @@ def cmd_capture(args):
     sdr.activateStream(st)
     print(f"[capture] {args.secs:.0f}s @ 144.390 MHz on {args.antenna} "
           f"(APRS beacons are bursty - longer is better)")
-    n_want = int(args.secs * FS)
+    n_want = int(args.secs * FS_SDR)
     buf = np.empty(2 * 65536, np.int16)
     out = np.empty(2 * n_want, np.int16)
     got = 0
@@ -312,6 +317,10 @@ def cmd_capture(args):
     sdr.closeStream(st)
     iq = ((out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32))
           / 32768.0).astype(np.complex64)[:got]
+    # decimate 2.048M -> 250k (exact 125/1024); every downstream sample-rate
+    # assumption (FS) is unchanged - the rate conversion happens once, here.
+    from scipy.signal import resample_poly
+    iq = resample_poly(iq, 125, 1024).astype(np.complex64)
     print(f"[capture] {len(iq)/FS:.1f}s captured, demodulating ...")
     # H6 control: RF burst counter - separates "band is quiet" from "our
     # demod is deaf". 10 ms envelope cells; a burst = >=80 ms above 2.5x

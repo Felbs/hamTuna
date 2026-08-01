@@ -27,7 +27,7 @@ import cw
 import cw_lm
 import cw_quality
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: offline relabel of the archival 250k corpus, no SDR
 HARVEST = HERE.parent / "lab" / "cw_harvest"
 
 

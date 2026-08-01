@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import cw
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: offline regression test on archival 250k corpus
 CORPUS = HERE.parent / "lab" / "cw_corpus"
 CORPUS_JSONL = HERE.parent / "lab" / "cw_corpus.jsonl"
 Q_TOLERANCE = 0.15        # allow small drift; a bigger q drop = regression

@@ -40,7 +40,8 @@ try:
 except Exception:
     radio_lock = None
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: HF panel on cw.py's magnitude/envelope path, verified
+#                 working daily; 250 kHz IS the panel's span contract (SPAN_KHZ)
 N_FFT = 2048
 N_HI = 8192            # high-res spectrum bins (~30 Hz/bin over 250 kHz) for zoom
 DISP_BINS = 500

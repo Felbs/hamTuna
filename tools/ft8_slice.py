@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import firwin, lfilter, resample_poly
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: offline slicer of archival 250k cs16 captures
 DIAL_OFF = {14025: 49_000.0, 7025: 49_000.0, 3560: 13_000.0, 18075: 25_000.0,
             21025: 49_000.0, 10120: 16_000.0, 24905: 10_000.0, 28025: 49_000.0}
 AUD = 12_000

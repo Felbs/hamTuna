@@ -27,7 +27,8 @@ import numpy as np
 from scipy.signal import firwin, lfilter, resample_poly
 
 HERE = Path(__file__).resolve().parent
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: offline decoder of archival 250k cs16 captures - no
+#                 SDR open here; iq_to_wav takes fs= for other-rate callers
 AUD = 12_000
 WSPRD = r"C:\wsjtx\bin\wsprd.exe"
 SLOT_S = 120                        # WSPR period
@@ -65,6 +66,8 @@ def decode_wav(wav_path, dial_mhz):
     cwd set makes wsprd look for parent/parent/file -> 'Cannot open data file')."""
     p = Path(wav_path)
     try:
+        # pipe-ok: wsprd emits ~a dozen spot lines parsed in-memory; a 120 s
+        # expiry abandons one slot, never a night's product
         out = subprocess.run([WSPRD, "-f", f"{dial_mhz:.6f}", p.name],
                              capture_output=True, text=True, timeout=120,
                              cwd=str(p.parent)).stdout

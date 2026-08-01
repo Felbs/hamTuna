@@ -29,7 +29,9 @@ import cw_lm
 import cw_quality
 import hamdb
 
-FS = 250_000.0
+FS = 250_000.0   # rate-ok: magnitude-only HF harvester (eye/envelope), verified
+#                  working daily on Antenna A; the 8/01 low-rate law hits
+#                  phase-sensitive modes - those capture at >=2.048M elsewhere
 OUT = HERE.parent / "lab" / "cw_harvest"
 # BIG-CORPUS MODE (2026-07-24, user: "we have a terabyte, save everything, feed it
 # to Fable 5 as training data"). Capture LONGER (whole QSOs -> context + repeated
@@ -123,7 +125,10 @@ def label_and_save(iq, khz, meta):
 
 
 # CW sub-band calling areas across HF (kHz) - the channels to scour for Morse
-SCAN_BANDS = [7025, 10120, 14025, 3560, 18075, 21025, 24905, 28025, 5357]
+# dwell weighted by the 7/24 prop atlas: 17m(18075)=85% open-eye gets 4x visits,
+# 60m(5357)=57% undersampled gets 2x; 80m mush demoted (9% open despite 309 trips)
+SCAN_BANDS = [18075, 7025, 18075, 10120, 5357, 18075, 14025, 3560, 18075,
+              21025, 5357, 18075, 24905, 28025]
 DWELL_CHUNKS = 3        # monitor chunks per band before hopping (when idle)
 
 
@@ -148,7 +153,7 @@ def run(khz, hours, antenna, scan=True):
     cur = bands[0]
     try:
         while time.time() < deadline:
-            iq = cw._grab(sdr, st, CHUNK_S, FS)
+            iq = cw._grab(sdr, st, CHUNK_S, FS, max_stall_s=60)
             if len(iq) < FS:
                 continue
             eye, off = best_eye(iq, cur)

@@ -23,7 +23,8 @@ sys.path.insert(0, str(HERE))
 import cw
 import cw_synth
 
-FS = 250_000.0                     # SDR sample rate of the captures
+FS = 250_000.0   # rate-ok: rate OF the archival corpus captures (offline
+#                  decode/training only - no SDR open in this file)
 AUD_AI = 125.0                     # envelope rate fed to the net (AG1LE used 125 Hz)
 CHARS = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/?"    # index 0 reserved for CTC blank
 BLANK = 0

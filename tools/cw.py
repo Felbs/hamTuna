@@ -17,6 +17,7 @@ Example:  python cw.py decode --file cap.cs16 --offset -6200
 """
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -627,6 +628,8 @@ def _ensure_sdr_dll_path():
 
 
 def _open_sdr(antenna, fs=250_000.0):
+    # rate-ok: magnitude-only HF use, verified working daily (CW harvester);
+    # phase-sensitive callers must pass >=2048000 (aprs_rx/pager_rx already do)
     _ensure_sdr_dll_path()
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
@@ -648,19 +651,40 @@ def _open_sdr(antenna, fs=250_000.0):
     return sdr, st
 
 
-def _grab(sdr, st, secs, fs=250_000.0):
+def _grab(sdr, st, secs, fs=250_000.0, max_stall_s=None):
+    """Read secs of IQ. If max_stall_s is set, raise once that long passes
+    with NO samples delivered.
+
+    Why the stall guard exists (2026-08-01): a wedged RSPdx can OPEN cleanly
+    and then deliver nothing — readStream just times out forever with
+    ret == -1, which the loop below treats as 'keep waiting'. The meteor
+    baseline spun inside this loop for 3 hours on a silent stream, its
+    3-hour deadline unreachable because it was checked between grabs that
+    never returned. Default None keeps the historical behavior for the
+    harvester and every other caller; long-running unattended consumers
+    should pass a bound, because a stream that says nothing for a minute is
+    not late — it is dead, and the honest move is to crash loudly.
+    """
     n_want = int(secs * fs)
     buf = np.empty(2 * 65536, np.int16)
     out = np.empty(2 * n_want, np.int16)
     got = 0
+    t_last = time.time()
     while got < n_want:
         r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
         if r.ret > 0:
             n = min(r.ret, n_want - got)
             out[2 * got:2 * (got + n)] = buf[:2 * n]
             got += n
+            t_last = time.time()
         elif r.ret < 0 and r.ret != -1:
             break
+        if max_stall_s and time.time() - t_last > max_stall_s:
+            raise RuntimeError(
+                f"SDR stream stalled: no samples for {max_stall_s:.0f}s "
+                f"({got}/{n_want} delivered). Device opens but does not "
+                f"stream — restart SDRplayAPIService and run a sacrificial "
+                f"stream probe; an OPEN is not a health check.")
     return ((out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32))
             / 32768.0).astype(np.complex64)[:got]
 
@@ -674,7 +698,7 @@ def cmd_listen(args):
     sdr, st = _open_sdr(args.antenna, args.fs)
     sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
     _t.sleep(0.2)
-    iq = _grab(sdr, st, args.secs, args.fs)
+    iq = _grab(sdr, st, args.secs, args.fs, max_stall_s=60)
     sdr.deactivateStream(st); sdr.closeStream(st)
     off = find_offset(iq, args.fs)
     env, a = envelope(iq, args.fs, off)

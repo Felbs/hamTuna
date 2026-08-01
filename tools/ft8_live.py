@@ -23,7 +23,8 @@ import numpy as np
 from scipy.signal import firwin, lfilter, resample_poly
 
 HERE = Path(__file__).resolve().parent
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: offline decoder of archival 250k cs16 captures - no
+#                 SDR open here; callers with other rates pass fs= explicitly
 AUD = 12_000
 JT9 = r"C:\wsjtx\bin\jt9.exe"
 DIAL_OFF = {14025: 49_000.0, 7025: 49_000.0, 3560: 13_000.0, 18075: 25_000.0,

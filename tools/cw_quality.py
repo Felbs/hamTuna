@@ -41,7 +41,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import cw
 
-FS = 250_000.0
+FS = 250_000.0  # rate-ok: offline scorer of archival 250k corpus captures
 CORPUS = HERE.parent / "lab" / "cw_corpus"
 
 # copy-quality cliffs (Q eye-opening), calibrated on the corpus + Pe(Q):
