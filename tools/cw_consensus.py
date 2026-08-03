@@ -231,14 +231,105 @@ def cmd_ab(args):
     return 0
 
 
+
+
+# ==========================================================================
+# CROSS-CAPTURE (session) consensus
+# ==========================================================================
+def sessions(max_gap_s=600):
+    """Group captures into SESSIONS: same band, consecutive, recorded
+    within max_gap_s of each other. The harvester trip-records whenever
+    the eye opens, so a busy station produces a run of captures of the
+    SAME transmission - many more copies than any single capture holds."""
+    from datetime import datetime
+    rows = []
+    for j in sorted(glob.glob(str(HARVEST / "cw_*.json"))):
+        stem = Path(j).stem
+        parts = stem.split("_")
+        if len(parts) < 3:
+            continue
+        # only captures that actually decoded can contribute copies;
+        # counting the silent ones inflated session sizes 8/03
+        try:
+            if not ((json.loads(Path(j).read_text()).get("full")
+                     or {}).get("text") or "").strip():
+                continue
+        except Exception:
+            continue
+        try:
+            t = datetime.strptime(parts[2].rstrip("Z"), "%Y%m%dT%H%M%S")
+        except ValueError:
+            continue
+        rows.append((parts[1], t, j))
+    rows.sort()
+    out, cur = [], []
+    for r in rows:
+        if cur and r[0] == cur[-1][0] and                 (r[1] - cur[-1][1]).total_seconds() <= max_gap_s:
+            cur.append(r)
+        else:
+            if len(cur) > 1:
+                out.append(cur)
+            cur = [r]
+    if len(cur) > 1:
+        out.append(cur)
+    return out
+
+
+def cmd_session(args):
+    """Pool tokens across a session and vote - the cross-capture lever."""
+    ses = sessions(args.gap)
+    ses.sort(key=lambda s: -len(s))
+    print(f"{len(ses)} sessions; showing the largest {args.n}")
+    print("")
+    gained = same = 0
+    for grp in ses[:args.n]:
+        khz = grp[0][0]
+        pooled, per_capture_best = [], {}
+        for _, _, j in grp:
+            _d, txt = full_text(j)
+            toks = [t for t in re.split(r"[^A-Z0-9?/]+", txt.upper()) if t]
+            pooled += toks
+            res = consensus_pass(toks)
+            for r in res:
+                k = r["consensus"]
+                if r["copies"] > per_capture_best.get(k, (0,))[0]:
+                    per_capture_best[k] = (r["copies"], r["margin"])
+        pooled_res = consensus_pass(pooled)
+        calls = [r for r in pooled_res
+                 if mr.CALLSIGN.match(r["consensus"]) and r["copies"] >= 3]
+        print(f"--- {float(khz)/1000:.3f} MHz, {len(grp)} captures, "
+              f"{len(pooled)} pooled tokens")
+        for r in calls[:5]:
+            was = per_capture_best.get(r["consensus"], (0, 0))
+            arrow = f"{was[0]} -> {r['copies']}" if was[0] else                     f"NEW ({r['copies']})"
+            if r["copies"] > was[0]:
+                gained += 1
+            else:
+                same += 1
+            n_caps = sum(1 for _, _, j in grp
+                         if r["consensus"][:3] in full_text(j)[1].upper())
+            print(f"    {r['consensus']:<10} copies {arrow:<12} "
+                  f"margin {r['margin']:.2f}   seen in {n_caps}/{len(grp)} captures")
+        if not calls:
+            print("    (no callsign reached 3 copies pooled)")
+    print("")
+    print(f"callsign consensus strengthened by pooling: {gained}; "
+          f"unchanged: {same}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("demo"); d.add_argument("--n", type=int, default=12)
     a = sub.add_parser("ab"); a.add_argument("--n", type=int, default=25)
+    ss = sub.add_parser("session")
+    ss.add_argument("--n", type=int, default=8)
+    ss.add_argument("--gap", type=float, default=600)
     args = ap.parse_args()
-    sys.exit(cmd_demo(args) if args.cmd == "demo" else cmd_ab(args))
+    fn = {"demo": cmd_demo, "ab": cmd_ab, "session": cmd_session}[args.cmd]
+    sys.exit(fn(args))
 
 
 if __name__ == "__main__":
