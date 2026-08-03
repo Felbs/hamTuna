@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hamTuna CW review</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{--bg:#06080b;--panel:#0c1116;--edge:#1b2530;--ink:#dfe7ee;
+        --muted:#7d8f9e;--faint:#4a5866;--key:#ffcf5c;--ok:#6ee7a0;
+        --dim:rgba(255,207,92,.18)}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);
+       font:13px/1.5 Consolas,"Cascadia Mono",Menlo,monospace;
+       max-width:1080px;margin:0 auto;padding:18px}
+  h1{font-size:15px;letter-spacing:.26em}h1 b{color:var(--key)}
+  .sub{color:var(--muted);font-size:11px;margin:2px 0 12px}
+  #tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
+         background:var(--edge);border:1px solid var(--edge);margin-bottom:12px}
+  .tile{background:var(--panel);padding:9px;text-align:center}
+  .tile .v{font-size:20px;font-weight:700}
+  .tile .l{font-size:9px;letter-spacing:.13em;color:var(--muted)}
+  #filters{display:flex;gap:8px;align-items:center;margin-bottom:10px;
+           font-size:11px;color:var(--muted)}
+  #filters button{background:var(--panel);color:var(--ink);
+    border:1px solid var(--edge);font:inherit;font-size:11px;
+    padding:3px 9px;cursor:pointer}
+  #filters button.on{color:var(--key);border-color:var(--key)}
+  .row{border:1px solid var(--edge);background:var(--panel);
+       margin-bottom:8px;padding:9px 12px}
+  .row.play{border-color:var(--key)}
+  .hdr{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .hdr .id{color:var(--muted);font-size:11px}
+  .hdr .band{color:var(--key);font-weight:700}
+  .hdr .meta{color:var(--faint);font-size:11px;margin-left:auto}
+  .txt{margin:6px 0 4px;font-size:14px;letter-spacing:.04em;
+       word-break:break-word}
+  .txt .w{color:var(--ok)}
+  .txt .c{color:var(--key);font-weight:700}
+  .strip{height:26px;width:100%;display:block;margin:6px 0 2px}
+  .btns{display:flex;gap:6px;align-items:center;margin-top:4px}
+  .btns button{background:var(--bg);color:var(--key);
+    border:1px solid var(--faint);font:inherit;font-size:11px;
+    padding:2px 9px;cursor:pointer}
+  .btns button:hover{border-color:var(--key)}
+  .verdict{margin-left:auto;font-size:11px;color:var(--muted)}
+  .verdict b{color:var(--ok)}
+  footer{color:var(--faint);font-size:10px;margin-top:14px}
+</style>
+</head>
+<body>
+<h1>HAM<b>TUNA</b> &nbsp;CW REVIEW</h1>
+<div class="sub">the ear is the referee &mdash; listen, then judge the decode</div>
+<div id="tiles">
+  <div class="tile"><div class="v" id="t_n">–</div><div class="l">CONFIRMED CW</div></div>
+  <div class="tile"><div class="v" id="t_read">–</div><div class="l">READABLE ≥30%</div></div>
+  <div class="tile"><div class="v" id="t_call">–</div><div class="l">WITH CALLSIGN</div></div>
+  <div class="tile"><div class="v" id="t_judged">0</div><div class="l">YOU JUDGED</div></div>
+</div>
+<div id="filters">
+  <span>show:</span>
+  <button data-f="best" class="on">readable first</button>
+  <button data-f="calls">callsigns only</button>
+  <button data-f="all">everything</button>
+  <span id="count" style="margin-left:auto"></span>
+</div>
+<div id="list"></div>
+<footer>audio is a clean 600 Hz sidetone re-keyed by the capture's own
+  envelope at the auto-centered carrier &middot; verdicts are stored in this
+  browser only &middot; file-reader panel, never touches the radio</footer>
+<script>
+"use strict";
+let ROWS = [], MODE = "best";
+const V = JSON.parse(localStorage.cw_verdicts || "{}");
+const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const WORDS = new Set(["CQ","DE","TU","73","QRZ","TEST","POTA","SOTA","RST","TNX","UP","QTH","NAME","ANT","PWR","WX","HW","BK","AR","SK","K","R","ES","GM","GA","GE","OM","QSL","FB","RIG","KN","5NN","599","DX","CFM","PSE","AGN","OP","QRP"]);
+const CALL = /^[A-Z]{1,2}[0-9][A-Z]{1,3}$/;
+
+function paintText(t){
+  return esc(t).split(/(\s+)/).map(w=>{
+    const u = w.toUpperCase();
+    if (WORDS.has(u)) return `<span class="w">${w}</span>`;
+    if (CALL.test(u)) return `<span class="c">${w}</span>`;
+    return w;
+  }).join("");
+}
+function strip(el, row){
+  fetch(`/strip.json?iq=${encodeURIComponent(row.iq)}&hz=${row.hz}`)
+    .then(r=>r.json()).then(d=>{
+      if (!d.cells) return;
+      const w = el.clientWidth || 800, h = 26;
+      const cv = document.createElement("canvas");
+      cv.width = d.cells.length; cv.height = 1;
+      const ctx = cv.getContext("2d");
+      const im = ctx.createImageData(d.cells.length, 1);
+      d.cells.forEach((v,i)=>{
+        const c = v ? [255,207,92,255] : [20,28,36,255];
+        im.data.set(c, 4*i);
+      });
+      ctx.putImageData(im,0,0);
+      el.style.background = `url(${cv.toDataURL()}) left center / 100% 100% no-repeat`;
+    }).catch(()=>{});
+}
+function judge(id, verdict){
+  V[id] = verdict; localStorage.cw_verdicts = JSON.stringify(V); render();
+}
+function play(row, el){
+  document.querySelectorAll(".row").forEach(r=>r.classList.remove("play"));
+  el.classList.add("play");
+  const a = document.getElementById("aud");
+  a.src = `/audio.wav?iq=${encodeURIComponent(row.iq)}&hz=${row.hz}`;
+  a.play().catch(()=>{});
+}
+function render(){
+  let rows = ROWS.slice();
+  if (MODE === "calls") rows = rows.filter(r=>r.calls.length);
+  if (MODE === "best") rows = rows.filter(r=>r.known>0 || r.calls.length);
+  document.getElementById("count").textContent = `${rows.length} shown`;
+  document.getElementById("t_judged").textContent = Object.keys(V).length;
+  const list = document.getElementById("list");
+  list.innerHTML = rows.map((r,i)=>`
+    <div class="row" id="row${i}">
+      <div class="hdr">
+        <span class="band">${(r.khz/1000).toFixed(3)} MHz</span>
+        <span class="id">${r.id}</span>
+        <span class="meta">${Math.round(r.wpm)} wpm &middot; rhythm ${r.rhythm}
+          &middot; eye ${r.eye} &middot; ${r.hz>0?"+":""}${Math.round(r.hz)} Hz</span>
+      </div>
+      <div class="txt">${paintText(r.text) || "<span style='color:var(--faint)'>(no text)</span>"}</div>
+      <div class="strip" id="strip${i}"></div>
+      <div class="btns">
+        <button onclick="play(ROWS_IDX[${i}], document.getElementById('row${i}'))">&#9654; LISTEN</button>
+        <button onclick="judge('${r.id}','morse')">&#10003; real morse</button>
+        <button onclick="judge('${r.id}','junk')">&#10007; not morse</button>
+        <span class="verdict">${V[r.id] ? "you said <b>"+V[r.id]+"</b>" : ""}</span>
+      </div>
+    </div>`).join("");
+  window.ROWS_IDX = rows;
+  rows.forEach((r,i)=> strip(document.getElementById("strip"+i), r));
+}
+fetch("/catalog.json").then(r=>r.json()).then(d=>{
+  ROWS = d.rows;
+  document.getElementById("t_n").textContent = ROWS.length;
+  document.getElementById("t_read").textContent =
+    ROWS.filter(r=>r.known>=0.3).length;
+  document.getElementById("t_call").textContent =
+    ROWS.filter(r=>r.calls.length).length;
+  render();
+});
+document.querySelectorAll("#filters button").forEach(b=>{
+  b.onclick = () => {
+    document.querySelectorAll("#filters button").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on"); MODE = b.dataset.f; render();
+  };
+});
+</script>
+<audio id="aud" style="display:none"></audio>
+</body>
+</html>
