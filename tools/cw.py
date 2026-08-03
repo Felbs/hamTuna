@@ -554,6 +554,25 @@ def find_offset(iq, fs, search=15000):
     return (int(np.argmax(band)) - k) * fs / N
 
 
+
+def aim(iq, fs, search=15000.0, prefer_cw=True):
+    """Carrier aim for the LIVE paths. Defaults to the cocktail-party
+    selector (cw_center: census + eye x rhythm audition), which found the
+    true CW carrier a median 3.3 kHz from power-argmax across the whole
+    harvested corpus (8/03). Falls back to find_offset if the selector
+    finds no keyed candidate, so behaviour is never worse than before."""
+    if prefer_cw:
+        try:
+            import cw_center
+            res = cw_center.pick(iq, fs, search=search)
+            b = res.get("best")
+            if b and b.get("rhythm", 0) > 0:
+                return float(b["hz"]), b
+        except Exception:
+            pass
+    return float(find_offset(iq, fs, search)), None
+
+
 def cmd_selftest(args):
     print("=" * 60)
     print("hamTuna CW self-test (synthesize -> noise -> decode)")
@@ -592,8 +611,14 @@ def cmd_decode(args):
     iq = (raw[0::2] + 1j * raw[1::2]).astype(np.complex64)
     off = args.offset
     if off is None:
-        off = find_offset(iq, args.fs)
-        print(f"[cw] auto-found carrier at {off:+.0f} Hz")
+        off, pick = aim(iq, args.fs)
+        if pick:
+            print(f"[cw] auto-centered on {off:+.0f} Hz "
+                  f"(eye {pick['eye']}, rhythm {pick['rhythm']}, "
+                  f"{pick['wpm']:.0f} wpm)")
+        else:
+            print(f"[cw] no keyed carrier found - power-argmax "
+                  f"{off:+.0f} Hz")
     env, a = envelope(iq, args.fs, off)
     txt, info = decode_env(env, a)
     wpm = info.get("wpm", 0)
@@ -700,7 +725,10 @@ def cmd_listen(args):
     _t.sleep(0.2)
     iq = _grab(sdr, st, args.secs, args.fs, max_stall_s=60)
     sdr.deactivateStream(st); sdr.closeStream(st)
-    off = find_offset(iq, args.fs)
+    off, pick = aim(iq, args.fs)
+    if pick:
+        print(f"[cw] auto-centered {off:+.0f} Hz (rhythm {pick['rhythm']}, "
+              f"{pick['wpm']:.0f} wpm)", flush=True)
     env, a = envelope(iq, args.fs, off)
     txt, info = decode_env(env, a)
     wpm = info.get("wpm", 0)
