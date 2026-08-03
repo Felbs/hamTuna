@@ -37,6 +37,7 @@ from cw_ai import (AUD_AI, DOWN, FS, MODEL_PATH, _build_model, _callsign_recall,
 
 HERE = Path(__file__).resolve().parent
 MIN_EYE = [0.0]
+SOURCE = ["relabel"]
 HARVEST = HERE.parent / "lab" / "cw_harvest"
 OUT_PATH = HERE.parent / "lab" / "morse_ai_real.pt"
 MAX_SECS = 24.0                      # per-capture clip cap (matches training scale)
@@ -66,17 +67,36 @@ def _one_real(args):
         # (0.42 -> 0.55/0.79) while loss fell: the net was learning the
         # teacher's noise on marginal clips. --min-eye keeps only clips
         # where the teacher is trustworthy (eye is the copy-quality dial).
-        if not rl or rl.get("label_conf") not in ("verified", "decode"):
-            return None
-        if float(rl.get("eye", 0)) < MIN_EYE[0]:
-            return None
+        # SOURCE (8/03): --source center uses the AUTO-CENTERED aim and its
+        # decode. The July `relabel` aim was often on the wrong carrier
+        # (that is what sank rounds 1-2), and `center.is_cw` additionally
+        # certifies the capture actually contains keying - so this pool is
+        # both correctly aimed and CW-verified.
+        ctr = d.get("center") or {}
+        if SOURCE[0] == "center":
+            if not ctr.get("is_cw") or ctr.get("hz") is None:
+                return None
+            text = ctr.get("text")
+            if isinstance(text, (list, tuple)):
+                text = " ".join(str(x) for x in text)
+            text = (text or "").split("{")[0].strip()
+            off_hz = float(ctr["hz"])
+            if float(ctr.get("rhythm", 0)) < MIN_EYE[0] / 10.0:
+                return None
+        else:
+            if not rl or rl.get("label_conf") not in ("verified", "decode"):
+                return None
+            if float(rl.get("eye", 0)) < MIN_EYE[0]:
+                return None
+            text = rl.get("text", "")
+            off_hz = float(rl.get("off_hz", 0.0))
         if d.get("iq_file", "") in holdout:
             return None
-        lab = encode_label(rl.get("text", ""))
+        lab = encode_label(text)
         if len(lab) < 6:
             return None
         iq = _load_iq(str(HARVEST / d["iq_file"]))[: int(MAX_SECS * FS)]
-        env, aud = cw.envelope(iq, FS, float(rl.get("off_hz", 0.0)))
+        env, aud = cw.envelope(iq, FS, off_hz)
         feat = env_to_feat(env, aud)
         if len(feat) < DOWN * (len(lab) + 2):
             return None
@@ -184,6 +204,10 @@ def run(until="07:45", batch=48, max_steps=60000, lr=5e-4, seed=7, smoke=False):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--until", default="07:45")
+    ap.add_argument("--source", choices=("relabel", "center"),
+                    default="relabel",
+                    help="which aim+label to train on; 'center' = the "
+                         "auto-centered, CW-verified pool (8/03)")
     ap.add_argument("--min-eye", type=float, default=0.0,
                     help="drop clips whose eye-opening is below this - the "
                          "teacher-label trust gate (8/03 finding)")
@@ -196,4 +220,5 @@ if __name__ == "__main__":
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     MIN_EYE[0] = a.min_eye
+    SOURCE[0] = a.source
     run(until=a.until, lr=a.lr, batch=a.batch, max_steps=a.max_steps, smoke=a.smoke)

@@ -360,7 +360,8 @@ def _load_real_val():
         if not p.exists():
             continue
         try:
-            iq = _load_iq(str(p)); off = cw.find_offset(iq, FS, 50000)
+            iq = _load_iq(str(p))
+            off, _pick = cw.aim(iq, FS, search=15000.0)   # 8/03: see above
             env, aud = cw.envelope(iq, FS, off)
             out.append((env_to_feat(env, aud), text.upper()))
         except Exception:
@@ -382,7 +383,12 @@ def _load_callsign_val():
             calls = [c["call"] for c in d.get("verified_calls", [])]
             if calls and float(d.get("eye", 0)) >= 3.0:
                 iq = _load_iq(str(HERE.parent / "lab" / "cw_harvest" / d["iq_file"]))
-                off = cw.find_offset(iq, FS, 3000)
+                # 8/03 MEASUREMENT BUG: this searched +-3 kHz with
+                # power-argmax while the corpus's true CW carriers sit
+                # routinely +-5..15 kHz out - the validation set was aimed
+                # at NOISE, so "recall 0.0" was partly an instrument
+                # artifact. cw.aim() auto-centers (and falls back).
+                off, _pick = cw.aim(iq, FS, search=15000.0)
                 env, aud = cw.envelope(iq, FS, off)
                 out.append((env_to_feat(env, aud), set(calls)))
         except Exception:
