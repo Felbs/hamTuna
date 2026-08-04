@@ -110,7 +110,12 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
           "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
 TRANSCRIPT = deque(maxlen=60)
-AUDIO = deque(maxlen=AUD_FS * 45)      # 45 s: the EARS lane decodes this history
+AUDIO = deque(maxlen=AUD_FS * 45)      # streaming QUEUE - the wav handler DRAINS it
+EARS_RING = deque(maxlen=AUD_FS * 45)  # rolling 45 s HISTORY for the ears lane -
+#   separate from AUDIO on purpose: the streamer clears AUDIO every 50 ms, so a
+#   listener starves anything else reading it (found 8/04: ears lane read
+#   "filling 1058/120960" - and the drain also explains "barely audible":
+#   the stream pads silence whenever the queue runs dry)
 SIGLIST = {"band": None, "sigs": []}   # classifier's authoritative carrier list: [{khz,snr,cw,wpm}]
 SCANNING = False                       # True while an all-bands scan is hopping (prevents overlap)
 SCANRES = {"running": False, "done": False, "results": [], "best": None,
@@ -633,6 +638,7 @@ class SDRWorker(threading.Thread):
         a16 = np.clip(a / self.agc * 7000.0, -32767, 32767).astype(np.int16)
         with _alock:
             AUDIO.extend(a16)
+            EARS_RING.extend(a16)
 
     def _session(self):
         if radio_lock and not radio_lock.acquire("hamtuna_panel", "panel", 80, wait_s=30):
@@ -879,8 +885,12 @@ class EarsDecoder(threading.Thread):
                 continue
             try:
                 with _alock:
-                    pcm = np.array(AUDIO, np.float64) / 32768.0
+                    pcm = np.array(EARS_RING, np.float64) / 32768.0
                 if len(pcm) < AUD_FS * 15:
+                    with _lock:                       # breadcrumb, not silence
+                        DECODE["ears"] = {"text": "", "q": 0.0, "wpm": 0,
+                                          "tone_hz": 0, "elements": 0,
+                                          "note": f"filling {len(pcm)}/{AUD_FS*15}"}
                     continue
                 spec = np.abs(np.fft.rfft(pcm))
                 freqs = np.fft.rfftfreq(len(pcm), 1.0 / AUD_FS)
@@ -905,8 +915,14 @@ class EarsDecoder(threading.Thread):
                         "elements": int(info.get("elements", 0))}
                 with _lock:
                     DECODE["ears"] = ears
-            except Exception:
-                pass
+            except Exception as e:
+                # a silent forever-failure hid this lane for a whole session
+                # (8/04) - one honest breadcrumb per fault, never a pass
+                import traceback
+                with open(HERE.parent / "lab" / "ears_fault.log", "a",
+                          encoding="utf-8") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} {e!r}\n"
+                            f"{traceback.format_exc()}\n")
 
 
 def _wav_header(nbytes=0x7FFFF000):
