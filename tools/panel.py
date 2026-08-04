@@ -1007,13 +1007,26 @@ class H(BaseHTTPRequestHandler):
                            at=STATE["band"])
             threading.Thread(target=_scan_worker, daemon=True).start()
             self._send(json.dumps({"started": True}))
-        elif u.path == "/tune":                # move the CURSOR within the window
+        elif u.path == "/tune":                # move the CURSOR (hops window if needed)
             try:
                 khz = float(q["khz"][0])
+                # cross-band click (8/04, user: "the scan found Morse but I
+                # can't tune into any of it"): a scan hit or stale signal-list
+                # row can be OUTSIDE the current window - clamping silently
+                # pinned the cursor at the edge. Now the window HOPS to the
+                # band that contains the target, so a click always lands.
+                out = abs(khz - STATE["center_khz"]) > SPAN_KHZ / 2 - 0.5
+                if out:
+                    for _b, _ctr in BANDS.items():
+                        if abs(khz - float(_ctr)) <= SPAN_KHZ / 2 - 0.5:
+                            STATE["band"] = _b
+                            STATE["center_khz"] = float(_ctr)  # reader retunes
+                            break
                 # snap=1: refine to the TRUE peak in the high-res (~30 Hz) spectrum
                 # near the click, so the cursor lands exactly on the signal and stays
                 # locked to it at any zoom (coarse display bins otherwise drift on zoom)
-                if q.get("snap", ["0"])[0] == "1":
+                # (skipped on a cross-band hop: the hi-res slice is the OLD band)
+                if not out and q.get("snap", ["0"])[0] == "1":
                     with _lock:
                         hi = SPEC["hi"]; c = STATE["center_khz"]
                     if hi is not None and len(hi):
@@ -1360,8 +1373,12 @@ async function scanBands(){
     if(rows)o.innerHTML=`<div class=advrow>${rows}</div>`;
     if(r.done)break;}
   await refresh();
+  // every found fist is a BUTTON: click = jump straight to it, even across
+  // bands (the /tune window-hop makes cross-band clicks just work)
+  const fists=(r.results||[]).flatMap(x=>(x.hits||[]).map(h=>
+    `<span class="advband good" onclick="tune(${h.khz})" title="score ${h.score}">${x.band} ${h.khz.toFixed(1)} ~${h.wpm}wpm</span>`)).join('');
   o.innerHTML=(o.innerHTML||'')+
-    (r.best&&(r.best.cw>0)?`<div class=sub>tuned to the strongest fist on ${r.best.band} (${r.best.cw} keyed signals found)</div>`
+    (fists?`<div class=sub>found Morse — click to listen:</div><div class=advrow>${fists}</div>`
       :'<div class=sub>no keyed Morse on any band right now — try again this evening</div>');
   b.disabled=false;b.textContent=lbl;}
 async function advise(){let s;try{s=await api('/advisor');}catch(e){return;}
