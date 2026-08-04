@@ -1406,12 +1406,18 @@ function renderBadges(){const bd=$('badges');if(!bd)return;
     if(px<14||px>w-14)return '';
     const cls=x.cw===true?'sigbadge':'sigbadge cand';
     const txt=x.cw===true?('&#9679; CW '+(x.wpm||'')):'?';
+    // act on MOUSEDOWN + stop propagation: the waterfall's cursor-drag
+    // machinery grabs mousedown before a click can complete (8/04 user:
+    // clicking the badges "doesn't tune into them")
     return `<span class="${cls}" style="left:${px.toFixed(0)}px" `+
       `title="${x.khz.toFixed(2)} kHz - click to listen" `+
-      `onclick="tune(${x.khz})">${txt}</span>`;}).join('');}
+      `onmousedown="event.stopPropagation();event.preventDefault();tune(${x.khz});">${txt}</span>`;}).join('');}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
   SIGS=sigs;renderBadges();
+  // copyable CW floats to the TOP of the list (8/04 user: had to scroll to
+  // the bottom to find the one illuminated row); then candidates, data last
+  sigs.sort((a,b)=>((b.cw===true)-(a.cw===true))||((a.cw===false)-(b.cw===false))||(b.eye||0)-(a.eye||0));
   const cur=s.tune!==undefined?s.tune:c;
   list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-cur)<0.3;
     const tag=x.cw===true?`<span class=cwtag>&check;CW ${x.wpm}</span>`:(x.cw===false?'<span class="cwtag off">data/busy</span>':'<span class="cwtag off">…</span>');
