@@ -93,6 +93,23 @@ def cw_map(iq, fs, top=20):
         med_run_ms = float(np.median(runs)) / fps * 1000.0
         if not 25.0 <= med_run_ms <= 400.0:        # dit@45wpm .. dah@8wpm
             continue
+        # FSK veto (8/04 live calibration): RTTY's per-bin blink rate sneaks
+        # under the transition gate, but FSK has a tell OOK can't fake - the
+        # mark and space bins blink in ANTI-correlation. If a neighbor within
+        # ~1 kHz blinks complementary to this bin, it's FSK, not a fist.
+        z = on.astype(np.float32) - on.mean()
+        fsk = False
+        for nb in range(max(0, b - 8), min(snr.shape[1], b + 9)):
+            if abs(nb - b) < 2:
+                continue
+            zn = (snr[:, nb] > np.sqrt(p85 * p15)).astype(np.float32)
+            zn = zn - zn.mean()
+            den = np.sqrt((z * z).sum() * (zn * zn).sum())
+            if den > 1e-6 and float((z * zn).sum() / den) < -0.4:
+                fsk = True
+                break
+        if fsk:
+            continue
         # score: how far inside the Morse box each measure sits
         sc = min(1.0, (contrast - 3.0) / 10.0 + 0.4) \
             * (1.0 - abs(duty - 0.45) / 0.45) \
@@ -134,6 +151,11 @@ def _synth_band(fs=250_000.0, secs=20.0, seed=7):
     ft8 = ((t % 15.0) < 12.6).astype(np.float32)
     iq += (4.0 * ft8 * np.exp(2j * np.pi * 40e3 * t)).astype(np.complex64)
     iq += (4.0 * np.exp(2j * np.pi * -20e3 * t)).astype(np.complex64)  # carrier
+    # RTTY-like FSK @ 45.45 bd, 340 Hz shift: mark/space blink complementary
+    bit = (np.floor(t * 45.45) % 2).astype(np.float32)   # alternating idle
+    iq += (4.0 * bit * np.exp(2j * np.pi * 70e3 * t)).astype(np.complex64)
+    iq += (4.0 * (1 - bit) * np.exp(2j * np.pi * (70e3 + 340) * t)
+           ).astype(np.complex64)
     return iq, cw_at
 
 
