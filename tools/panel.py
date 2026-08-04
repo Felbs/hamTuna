@@ -33,6 +33,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
 import cw
 import cw_lm
+import cw_map
 import cw_quality
 import hamdb
 try:
@@ -109,9 +110,11 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
           "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
 TRANSCRIPT = deque(maxlen=60)
-AUDIO = deque(maxlen=AUD_FS * 4)
+AUDIO = deque(maxlen=AUD_FS * 45)      # 45 s: the EARS lane decodes this history
 SIGLIST = {"band": None, "sigs": []}   # classifier's authoritative carrier list: [{khz,snr,cw,wpm}]
 SCANNING = False                       # True while an all-bands scan is hopping (prevents overlap)
+SCANRES = {"running": False, "done": False, "results": [], "best": None,
+           "at": None}                 # async scan progress/results, served in /state
 _lock = threading.Lock()
 _alock = threading.Lock()
 _win = np.hanning(N_FFT).astype(np.float32)
@@ -771,8 +774,20 @@ class Classifier(threading.Thread):
             if iq is None:
                 continue
             band = STATE["band"]
+            # candidates = union(whole-band keying map, loud carriers). cw_map
+            # fingerprints EVERY bin for Morse rhythm in one pass - it finds the
+            # keyed fists that SNR-argmax walks straight past (8/03: the user
+            # found them by eye while detect_signals said the band was empty).
+            cands = list(detect_signals())
+            try:
+                for h in cw_map.cw_map(iq, FS, top=12):
+                    khz = round(STATE["center_khz"] + h["khz_off"], 3)
+                    if all(abs(khz - c["khz"]) > 0.3 for c in cands):
+                        cands.append({"khz": khz, "snr": h["snr_db"]})
+            except Exception:
+                pass
             out = []
-            for s in detect_signals():
+            for s in cands:
                 co = (s["khz"] - STATE["center_khz"]) * 1000.0
                 cw_ok, wpm, eye = False, 0, 0.0
                 try:
@@ -798,6 +813,83 @@ class Classifier(threading.Thread):
             # pass, so tags always match their carrier (no cross-snapshot mismatch)
             with _lock:
                 SIGLIST["band"] = band; SIGLIST["sigs"] = out
+
+
+def _scan_worker():
+    """Async all-bands scan body (started by /scanbands, guarded by SCANNING).
+    One cw_map whole-band look per band - no per-carrier probing, no server
+    lock held, page follows progress via /state's SCANRES."""
+    global SCANNING
+    orig = (STATE["band"], STATE["center_khz"])
+    results = []
+    try:
+        for band, ctr in BANDS.items():
+            SCANRES["at"] = band
+            STATE["band"] = band; STATE["center_khz"] = float(ctr)  # reader retunes
+            time.sleep(2.2)      # settle (gentle hop rate; fast hops wedge the RSPdx)
+            time.sleep(8.0)      # let the ring refill with THIS band's air
+            iq = ring_snapshot(8)
+            hits = []
+            if iq is not None:
+                try:
+                    hits = cw_map.cw_map(iq, FS, top=8)
+                except Exception:
+                    pass
+            results.append({"band": band, "cw": len(hits),
+                            "eye": round(max([h["score"] for h in hits], default=0.0) * 5, 1),
+                            "hits": [{"khz": round(ctr + h["khz_off"], 3),
+                                      "score": h["score"], "wpm": h["wpm_est"]}
+                                     for h in hits[:5]]})
+            SCANRES["results"] = list(results)
+    except Exception as e:
+        STATE["err"] = f"scan: {e}"[:80]
+    finally:
+        SCANNING = False
+    best = max(results, key=lambda r: (r["cw"],
+               max([h["score"] for h in r["hits"]], default=0.0))) if results else None
+    if best and best["cw"] > 0:
+        STATE["band"] = best["band"]; STATE["center_khz"] = float(BANDS[best["band"]])
+        STATE["tune_khz"] = best["hits"][0]["khz"]   # straight onto the best fist
+        STATE["chlock"] = False
+    else:                                     # nothing keyed anywhere -> restore
+        STATE["band"], STATE["center_khz"] = orig
+    SCANRES.update(running=False, done=True, best=best, at=None)
+
+
+class EarsDecoder(threading.Thread):
+    """The DECODE-WHAT-I-HEAR lane (8/03, user ask): decode the SAME audio
+    stream the user's ears get - tone-find, envelope, classic decoder. When
+    the IQ lane goes quiet but a human hears Morse, this lane is the referee
+    (it read the user's 34 wpm find and W1AW when the live lane showed '')."""
+    daemon = True
+
+    def run(self):
+        while True:
+            time.sleep(25)
+            if not STATE["running"] or STATE["mode"] != "CW":
+                continue
+            try:
+                with _alock:
+                    pcm = np.array(AUDIO, np.float64) / 32768.0
+                if len(pcm) < AUD_FS * 15:
+                    continue
+                spec = np.abs(np.fft.rfft(pcm))
+                freqs = np.fft.rfftfreq(len(pcm), 1.0 / AUD_FS)
+                m = (freqs > 200) & (freqs < 3000)
+                tone = float(freqs[m][np.argmax(spec[m])])
+                t = np.arange(len(pcm)) / AUD_FS
+                bb = pcm * np.exp(-2j * np.pi * tone * t)
+                k = max(1, int(AUD_FS // 200))
+                env = np.abs(np.convolve(bb, np.ones(k) / k, "same"))[::max(1, int(AUD_FS // 1000))]
+                txt, info = cw.decode_env_auto2(env.astype(np.float32), 1000.0)
+                w = float(info.get("wpm", 0))
+                ears = {"text": txt[-160:] if 3 <= w <= 45 else "",
+                        "wpm": round(w, 1), "tone_hz": round(tone),
+                        "elements": int(info.get("elements", 0))}
+                with _lock:
+                    DECODE["ears"] = ears
+            except Exception:
+                pass
 
 
 def _wav_header(nbytes=0x7FFFF000):
@@ -851,7 +943,7 @@ class H(BaseHTTPRequestHandler):
                      "lock", "err", "chlock", "cw_filter_hz",
                      "delivery_pct")}, "span": SPAN_KHZ,
                     "decode": dict(DECODE), "bands": BANDS, "modes": MODES,
-                    "transcript": list(TRANSCRIPT)[-14:],
+                    "transcript": list(TRANSCRIPT)[-14:], "scan": dict(SCANRES),
                     "smeter": round(max(0, (SPEC["peak_db"] - SPEC["noise_db"])), 1)}))
         elif u.path == "/set":
             if "band" in q and q["band"][0] in BANDS:
@@ -893,42 +985,20 @@ class H(BaseHTTPRequestHandler):
             self._send(json.dumps({"ok": True, "tune": STATE["tune_khz"],
                                    "found_cw": bool(cw_sigs), "n_cw": len(cw_sigs)}))
         elif u.path == "/scanbands":
-            # LIVE all-bands scan: hop each CW band, count copyable CW (open eye),
-            # then tune to the best. Bounded + exception-safe (won't hang the server).
+            # ASYNC all-bands scan (8/03): the synchronous version held every
+            # request behind a ~50 s hop sweep; a second press froze the UI for
+            # good. Now: start the guarded worker, return at once, the page
+            # polls /state for SCANRES. Per band: one settle + ring fill, then
+            # ONE cw_map whole-band look (every bin fingerprinted for keying
+            # rhythm) instead of eye-probing the 6 loudest carriers.
             global SCANNING
             if SCANNING:
-                self._send(json.dumps({"busy": True})); return
+                self._send(json.dumps({"started": False, "busy": True})); return
             SCANNING = True
-            orig = (STATE["band"], STATE["center_khz"])
-            results = []
-            try:
-                for band, ctr in BANDS.items():
-                    STATE["band"] = band; STATE["center_khz"] = float(ctr)  # reader retunes
-                    time.sleep(2.2)                                          # settle (gentle hop rate; fast hops wedge the RSPdx)
-                    iq = ring_snapshot(2)
-                    cwc, best_eye = 0, 0.0
-                    if iq is not None:
-                        for s in sorted(detect_signals(), key=lambda x: -x["snr"])[:6]:
-                            try:
-                                env, aud = envelope_locked(iq, (s["khz"] - ctr) * 1000.0, bw=400)
-                                eye = cw_quality.eye_opening(env)[0]   # scan judged at the proven ±400 (independent of user's filter pick)
-                                best_eye = max(best_eye, eye)
-                                if eye >= cw_quality.Q_READABLE:
-                                    cwc += 1
-                            except Exception:
-                                pass
-                    results.append({"band": band, "cw": cwc, "eye": round(float(best_eye), 1)})
-            except Exception as e:
-                STATE["err"] = f"scan: {e}"[:80]
-            finally:
-                SCANNING = False
-            best = max(results, key=lambda r: (r["cw"], r["eye"])) if results else None
-            if best and (best["cw"] > 0 or best["eye"] >= cw_quality.Q_READABLE):
-                STATE["band"] = best["band"]; STATE["center_khz"] = float(BANDS[best["band"]])
-                STATE["tune_khz"] = STATE["center_khz"]; STATE["chlock"] = False
-            else:                                     # nothing copyable anywhere -> restore
-                STATE["band"], STATE["center_khz"] = orig
-            self._send(json.dumps({"results": results, "best": best}))
+            SCANRES.update(running=True, done=False, results=[], best=None,
+                           at=STATE["band"])
+            threading.Thread(target=_scan_worker, daemon=True).start()
+            self._send(json.dumps({"started": True}))
         elif u.path == "/tune":                # move the CURSOR within the window
             try:
                 khz = float(q["khz"][0])
@@ -1028,6 +1098,7 @@ def main():
     Decoder().start()
     Verifier().start()
     Classifier().start()
+    EarsDecoder().start()
     ThreadingHTTPServer(("127.0.0.1", args.port), H).serve_forever()
 
 
@@ -1141,7 +1212,8 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
       <div class=stat><span>S-meter</span><b id=sm>&mdash;</b></div>
       <div class=smeter><div class=sfill id=smbar style=width:0%></div></div>
     </div>
-    <div><div class=lbl id=declbl>Live Morse transcript</div><div class=xscript id=xscript></div></div>
+    <div><div class=lbl id=declbl>Live Morse transcript</div><div class=xscript id=xscript></div>
+    <div id=earsline style="margin-top:6px;padding:8px;border:1px dashed var(--hair);border-radius:8px;font-size:14px"></div></div>
     <div class=newcall id=newcall></div>
     <div class=logbook>
       <div class=lbl style="display:flex;justify-content:space-between;align-items:baseline">
@@ -1238,6 +1310,12 @@ async function refresh(){
                   : (d.text?`<span class=xline>${d.text}</span>`:'<div class=sub>…listening for CW…</div>');
     xs.scrollTop=xs.scrollHeight;
   } else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
+  // EARS lane: decodes exactly the audio you are hearing (the referee when
+  // the live lane shows nothing but your ears clearly copy Morse)
+  const e=d.ears||{};
+  $('earsline').innerHTML=(e.text&&e.elements>=20)
+    ?`<b>👂 what you're hearing:</b> ${e.text} <span class=sub>(~${e.wpm} wpm, tone ${e.tone_hz} Hz)</span>`
+    :'<span class=sub>👂 ears lane: no readable Morse in the audio right now</span>';
   $('hint').textContent=d.hint||'';
   $('newcall').textContent=(d.new_calls&&d.new_calls.length)?('🎉 logged '+d.new_calls.join(' ')):'';
 }
@@ -1263,13 +1341,20 @@ async function autotune(){
 }
 async function scanBands(){
   const b=$('scanb'),lbl=b.textContent,o=$('scanout');
-  b.disabled=true;b.textContent='… scanning all bands (~15s) …';o.innerHTML='<span class=sub>hopping bands, listening for CW…</span>';
-  let r;try{r=await api('/scanbands');}catch(e){b.disabled=false;b.textContent=lbl;return;}
+  b.disabled=true;o.innerHTML='<span class=sub>looking at every band…</span>';
+  try{const st=await api('/scanbands');if(!st.started&&!st.busy)throw 0;}
+  catch(e){b.disabled=false;b.textContent=lbl;return;}
+  // async scan: the worker hops bands; we follow its progress via /state.scan
+  let r={};for(let i=0;i<60;i++){await new Promise(z=>setTimeout(z,2000));
+    try{r=(await api('/state')).scan||{};}catch(e){continue;}
+    b.textContent=r.at?('… looking at '+r.at+' …'):lbl;
+    const rows=(r.results||[]).map(x=>`<span class="advband${x.cw>0?' good':''}" onclick="set('band='+'${x.band}')">${x.band} ${x.cw>0?('✓'+x.cw):'—'}</span>`).join('');
+    if(rows)o.innerHTML=`<div class=advrow>${rows}</div>`;
+    if(r.done)break;}
   await refresh();
-  const rows=(r.results||[]).map(x=>`<span class="advband${x.cw>0?' good':''}" onclick="set('band='+'${x.band}')">${x.band} ${x.cw>0?('✓'+x.cw):('eye'+x.eye)}</span>`).join('');
-  o.innerHTML=`<div class=advrow>${rows}</div>`+
-    (r.best&&(r.best.cw>0)?`<div class=sub>tuned to ${r.best.band} (${r.best.cw} copyable CW)</div>`
-      :'<div class=sub>no copyable CW on any band right now — try again this evening</div>');
+  o.innerHTML=(o.innerHTML||'')+
+    (r.best&&(r.best.cw>0)?`<div class=sub>tuned to the strongest fist on ${r.best.band} (${r.best.cw} keyed signals found)</div>`
+      :'<div class=sub>no keyed Morse on any band right now — try again this evening</div>');
   b.disabled=false;b.textContent=lbl;}
 async function advise(){let s;try{s=await api('/advisor');}catch(e){return;}
   const o=$('advout');

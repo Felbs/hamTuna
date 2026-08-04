@@ -85,7 +85,8 @@ flowchart TD
 | **double-click** | reset to full band. |
 | **⊙ button** | recenter view on the cursor (find it). **⤢** full band. **+/−** zoom. |
 | **AUTO-TUNE** | best copyable CW on the CURRENT band. |
-| **SCAN ALL BANDS** | live hop every CW band, tune to the best (guarded, gentle dwell). |
+| **SCAN ALL BANDS** | ASYNC (8/03): `/scanbands` starts a guarded worker and returns at once; the page follows progress via `/state`'s `scan` object (`running/at/results/done/best`). Per band: one settle + ring fill, then ONE `cw_map` whole-band keying-fingerprint look (every bin at once) — no per-carrier probing, no server lock held, a second press gets `busy` instead of freezing the UI. Ends tuned to the strongest fist found. |
+| **EARS lane** | `EarsDecoder` thread decodes the SAME audio stream the user hears (tone-find → envelope → classic decoder) every ~25 s into `decode.ears` (`text/wpm/tone_hz/elements`), shown under the transcript (`#earsline`). The referee when the IQ lane shows nothing but a human clearly hears Morse (born from the 8/03 live session). |
 
 **Invariants — do not break:**
 - The cursor moves ONLY on click/drag/auto — never while zooming or panning.
