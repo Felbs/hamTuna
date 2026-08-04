@@ -45,7 +45,7 @@ import cw_center as cc  # noqa: E402
 import morse_repair as mr  # noqa: E402
 
 HARVEST = HERE.parent / "lab" / "cw_harvest"
-FS = 250000.0
+FS = 250000.0  # rate-ok: corpus-file read rate, not a capture path
 MIN_COPIES = 2
 GROUP_COST = 4          # max element distance to call two tokens copies
 

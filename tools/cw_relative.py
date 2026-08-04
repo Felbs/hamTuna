@@ -41,7 +41,7 @@ import cw  # noqa: E402
 import cw_center as cc  # noqa: E402
 
 HARVEST = HERE.parent / "lab" / "cw_harvest"
-FS = 250000.0
+FS = 250000.0  # rate-ok: corpus-file read rate, not a capture path
 WIN = 24            # marks per sliding window for the local ruler
 MIN_WIN = 8
 

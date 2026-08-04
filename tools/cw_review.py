@@ -34,7 +34,7 @@ import cw  # noqa: E402
 import cw_center as cc  # noqa: E402
 
 HARVEST = HERE.parent / "lab" / "cw_harvest"
-FS = 250000.0
+FS = 250000.0  # rate-ok: corpus-file read rate, not a capture path
 SIDETONE_HZ = 600.0
 WORDS = {"CQ", "DE", "TU", "73", "QRZ", "TEST", "POTA", "SOTA", "RST",
          "TNX", "UP", "QTH", "NAME", "ANT", "PWR", "WX", "HW", "BK", "AR",

@@ -45,7 +45,7 @@ HARVEST = LAB / "cw_harvest"
 BLIND = LAB / "judge_blind.jsonl"
 KEY = LAB / "judge_key.json"
 SCORES = LAB / "judge_scores.json"
-FS = 250000.0
+FS = 250000.0  # rate-ok: corpus-file read rate, not a capture path
 
 
 def decode_at(iq, hz):

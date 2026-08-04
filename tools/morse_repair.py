@@ -44,7 +44,7 @@ import cw  # noqa: E402
 import cw_center as cc  # noqa: E402
 
 HARVEST = HERE.parent / "lab" / "cw_harvest"
-FS = 250000.0
+FS = 250000.0  # rate-ok: corpus-file read rate, not a capture path
 
 # closed lexicon: what CW operators actually send
 PROSIGNS = ["CQ", "DE", "K", "KN", "AR", "SK", "BK", "R", "TU", "73", "88",
