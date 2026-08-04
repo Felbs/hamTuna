@@ -1133,6 +1133,9 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>hamTuna</title>
 .wrap{display:grid;grid-template-columns:1fr 320px;height:calc(100vh - 52px)}
 .left{display:flex;flex-direction:column;min-width:0;position:relative}
 .curline{position:absolute;top:0;bottom:0;width:2px;pointer-events:none;background:#fff;color:#ffd84a;box-shadow:0 0 6px currentColor;z-index:5}
+.sigbadge{position:absolute;top:2px;transform:translateX(-50%);z-index:6;background:#0e2f16;color:#7dff9a;border:1px solid #2fa15a;border-radius:6px;padding:1px 7px;font-size:11px;line-height:1.5;cursor:pointer;white-space:nowrap;box-shadow:0 0 5px #0008}
+.sigbadge:hover{background:#17512a}
+.sigbadge.cand{color:#9aa;border-color:#456;background:#101820}
 .curline::before{content:'';position:absolute;top:0;left:-5px;border-left:6px solid transparent;border-right:6px solid transparent;border-top:9px solid currentColor}
 .curline::after{content:'';position:absolute;bottom:0;left:-5px;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:9px solid currentColor}
 .zoomctl{position:absolute;top:8px;right:10px;display:flex;flex-direction:column;gap:5px;z-index:6}
@@ -1190,7 +1193,7 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
   <div class=sub>click a signal &rarr; snap to its peak</div>
 </div>
 <div class=wrap>
-  <div class=left><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div>
+  <div class=left><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div><div id=badges></div>
     <div class=zoomctl>
       <button onclick="zoomBy(0.6,0.5)" title="zoom in (narrower band)">+</button>
       <button onclick="zoomBy(1.7,0.5)" title="zoom out">&minus;</button>
@@ -1392,8 +1395,23 @@ async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
 async function togLock(){await api('/lock?on='+(ST.chlock?0:1));refresh();}
 async function tune(khz){await api('/tune?khz='+khz);refresh();}
 async function setFilt(hz){await api('/cwfilter?hz='+hz);refresh();}
+let SIGS=[];   // latest classified signals - feeds the waterfall badges
+// Waterfall badges (8/04, user ask): a clickable tab floats right above each
+// detected Morse signal ON the waterfall - see code, click code, hear code.
+function renderBadges(){const bd=$('badges');if(!bd)return;
+  if(VC===null||VS===null){bd.innerHTML='';return;}
+  const w=spec.clientWidth;
+  bd.innerHTML=SIGS.filter(x=>x.cw!==false).map(x=>{
+    const px=(x.khz-(VC-VS/2))/VS*w;
+    if(px<14||px>w-14)return '';
+    const cls=x.cw===true?'sigbadge':'sigbadge cand';
+    const txt=x.cw===true?('&#9679; CW '+(x.wpm||'')):'?';
+    return `<span class="${cls}" style="left:${px.toFixed(0)}px" `+
+      `title="${x.khz.toFixed(2)} kHz - click to listen" `+
+      `onclick="tune(${x.khz})">${txt}</span>`;}).join('');}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
+  SIGS=sigs;renderBadges();
   const cur=s.tune!==undefined?s.tune:c;
   list.innerHTML=sigs.length?sigs.map(x=>{const on=Math.abs(x.khz-cur)<0.3;
     const tag=x.cw===true?`<span class=cwtag>&check;CW ${x.wpm}</span>`:(x.cw===false?'<span class="cwtag off">data/busy</span>':'<span class="cwtag off">…</span>');
@@ -1440,6 +1458,7 @@ async function draw(){
   let s;try{s=await api('/spectrum'+q);}catch(e){setTimeout(draw,300);return;}
   if(!q){SDRCENTER=s.center;FULLSPAN=s.span;if(VIEW.c===null){VIEW.c=s.center;VIEW.s=s.span;}}
   const db=s.db;DB=db;VC=s.center;VS=s.span;if(!db.length){setTimeout(draw,150);return;}
+  renderBadges();   // badges track every zoom/pan so they stay glued to their signals
   const w=spec.width,h=spec.height;sx.clearRect(0,0,w,h);
   sx.strokeStyle='#0c1a22';for(let i=0;i<=4;i++){const y=h*i/4;sx.beginPath();sx.moveTo(0,y);sx.lineTo(w,y);sx.stroke();}
   const lo=s.noise-6,hi=s.peak+6,rng=Math.max(6,hi-lo);
