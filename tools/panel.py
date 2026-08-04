@@ -883,8 +883,16 @@ class EarsDecoder(threading.Thread):
                 env = np.abs(np.convolve(bb, np.ones(k) / k, "same"))[::max(1, int(AUD_FS // 1000))]
                 txt, info = cw.decode_env_auto2(env.astype(np.float32), 1000.0)
                 w = float(info.get("wpm", 0))
-                ears = {"text": txt[-160:] if 3 <= w <= 45 else "",
-                        "wpm": round(w, 1), "tone_hz": round(tone),
+                # salad gate (8/04 gauntlet finding): a strong STEADY carrier
+                # decodes to ?/M/T/E-heavy salad with big element counts - 74
+                # of 81 overnight "ears copies" were this. Only surface text
+                # whose letter mix looks like language, and always report q.
+                chars = [c for c in txt if c != " "]
+                q = (1.0 - sum(1 for c in chars if c in "?MTE") / len(chars)) \
+                    if chars else 0.0
+                ears = {"text": txt[-160:] if (3 <= w <= 45 and q > 0.45) else "",
+                        "q": round(q, 2), "wpm": round(w, 1),
+                        "tone_hz": round(tone),
                         "elements": int(info.get("elements", 0))}
                 with _lock:
                     DECODE["ears"] = ears
