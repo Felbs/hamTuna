@@ -16,7 +16,9 @@ Modes:
 Example:  python aprs.py capture --secs 60 --antenna "Antenna A"
 """
 import argparse
+import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -26,6 +28,14 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 LAB = HERE.parent / "lab"
 LAB.mkdir(exist_ok=True)
+
+# skyTuna fusion map: decoded station positions append here (JSONL records
+# {t, id, lat, lon, src:"aprs", ...} - sky_panel.py tails the file and
+# converts to km offsets server-side). STATION positions only, broadcast
+# on-air by the stations themselves; the QTH/receiver location is NEVER
+# written to any record.
+SKY_APRS = Path(os.environ.get(
+    "SKY_APRS_JSONL", r"Z:\src\skyTuna\data\aprs.jsonl"))
 
 FS = 250_000.0  # rate-ok: DEMOD rate only - capture happens at FS_SDR below,
 #                 decimated 125/1024 down to FS right after the grab
@@ -154,7 +164,207 @@ def parse_ax25(body):
         text = info.decode("ascii", errors="replace")
     except Exception:
         text = repr(info)
-    return {"src": src, "dst": dst, "info": text}
+    d = {"src": src, "dst": dst, "info": text}
+    pos = decode_position(dst, text)
+    if pos:
+        d.update(pos)
+    return d
+
+
+# ==========================================================================
+# APRS position decode (APRS101): MIC-E + plain-text formats
+# ==========================================================================
+# MIC-E packs latitude into the DESTINATION callsign (one digit per char,
+# with N/S, E/W and a +100-deg longitude offset riding the char ranges) and
+# longitude/speed/course into the first info bytes. Plain-text positions
+# are ddmm.mmN/dddmm.mmW after a '!'/'=' DTI (or '/'/'@' + 7-char time).
+
+_MICE_DTI = "`'\x1c\x1d"          # current/old GPS data type indicators
+
+_PLAIN_POS = re.compile(
+    r"(\d{2})([\d ]{2}\.[\d ]{2})([NS])(.)"
+    r"(\d{3})([\d ]{2}\.[\d ]{2})([EW])(.)")
+_CSE_SPD = re.compile(r"^(\d{3})/(\d{3})")
+_ALT_FT = re.compile(r"/A=(\d{6})")
+_MICE_ALT = re.compile(r"^[>\]]?([!-{]{3})\}")
+
+
+def _mice_lat_digit(c):
+    """Dest char -> lat digit (K/L/Z = ambiguity space -> 0)."""
+    if "0" <= c <= "9":
+        return ord(c) - ord("0")
+    if "A" <= c <= "J":              # custom message bits
+        return ord(c) - ord("A")
+    if "P" <= c <= "Y":              # standard message bits
+        return ord(c) - ord("P")
+    if c in "KLZ":                   # position ambiguity
+        return 0
+    return None
+
+
+def decode_mice(dst, info):
+    """MIC-E: lat from dest chars, lon/speed/course from info bytes."""
+    if len(info) < 9 or info[0] not in _MICE_DTI:
+        return None
+    base = dst.split("-")[0]
+    if len(base) != 6:
+        return None
+    digs = [_mice_lat_digit(c) for c in base]
+    if any(v is None for v in digs):
+        return None
+    lat_min = digs[2] * 10 + digs[3] + (digs[4] * 10 + digs[5]) / 100.0
+    lat = digs[0] * 10 + digs[1] + lat_min / 60.0
+    if lat > 90 or lat_min >= 60:
+        return None
+    north = base[3] >= "P"           # P-Y/Z = North; 0-9/L = South
+    offset = base[4] >= "P"          # P-Y/Z = +100 deg longitude
+    west = base[5] >= "P"            # P-Y/Z = West; 0-9/L = East
+    ld = ord(info[1]) - 28
+    if offset:
+        ld += 100
+    if 180 <= ld <= 189:
+        ld -= 80
+    elif 190 <= ld <= 199:
+        ld -= 190
+    lm = ord(info[2]) - 28
+    if lm >= 60:
+        lm -= 60
+    lh = ord(info[3]) - 28
+    if not (0 <= ld <= 179 and 0 <= lm <= 59 and 0 <= lh <= 99):
+        return None
+    lon = ld + (lm + lh / 100.0) / 60.0
+    sp = ord(info[4]) - 28
+    dc = ord(info[5]) - 28
+    se = ord(info[6]) - 28
+    if not (0 <= sp <= 99 and 0 <= dc <= 99 and 0 <= se <= 99):
+        return None
+    speed = sp * 10 + dc // 10
+    course = (dc % 10) * 100 + se
+    if speed >= 800:
+        speed -= 800
+    if course >= 400:
+        course -= 400
+    out = {"lat": round(lat if north else -lat, 5),
+           "lon": round(-lon if west else lon, 5),
+           "speed_kt": speed, "course": course, "fmt": "mice"}
+    tail = info[9:]                  # optional status; may lead with alt
+    m = _MICE_ALT.match(tail)
+    if m:
+        a = m.group(1)
+        out["alt_m"] = ((ord(a[0]) - 33) * 91 * 91 + (ord(a[1]) - 33) * 91
+                        + (ord(a[2]) - 33)) - 10000
+    return out
+
+
+def decode_plain(info):
+    """'!'/'=' uncompressed ddmm.mmN/dddmm.mmW, '/'/'@' + 7-char time."""
+    if not info:
+        return None
+    dti = info[0]
+    if dti in "!=":
+        body = info[1:]
+    elif dti in "/@" and len(info) > 8:
+        body = info[8:]              # skip DDHHMMz / HHMMSSh timestamp
+    else:
+        return None
+    m = _PLAIN_POS.search(body)
+    if not m:
+        return None
+    lat = int(m.group(1)) + float(m.group(2).replace(" ", "0")) / 60.0
+    if m.group(3) == "S":
+        lat = -lat
+    lon = int(m.group(5)) + float(m.group(6).replace(" ", "0")) / 60.0
+    if m.group(7) == "W":
+        lon = -lon
+    if abs(lat) > 90 or abs(lon) > 180:
+        return None
+    out = {"lat": round(lat, 5), "lon": round(lon, 5), "fmt": "plain"}
+    rest = body[m.end():]
+    mc = _CSE_SPD.match(rest)
+    if mc:
+        out["course"] = int(mc.group(1))
+        out["speed_kt"] = int(mc.group(2))
+        rest = rest[mc.end():]
+    ma = _ALT_FT.search(rest)
+    if ma:
+        out["alt_m"] = round(int(ma.group(1)) * 0.3048, 1)
+    rest = rest.strip()
+    if rest:
+        out["comment"] = rest[:40]
+    return out
+
+
+def decode_position(dst, info):
+    """Best-effort APRS position from an AX.25 frame. None if positionless."""
+    if info and info[0] in _MICE_DTI:
+        return decode_mice(dst, info)
+    return decode_plain(info)
+
+
+def mice_encode(lat, lon, speed_kt=0, course=0, symbol=">", table="/"):
+    """Known coords -> (dest, info) MIC-E pair. Selftest-side inverse of
+    decode_mice (standard message bits, no ambiguity)."""
+    north, lat = lat >= 0, abs(lat)
+    west, lon = lon <= 0, abs(lon)
+    latmin = (lat - int(lat)) * 60.0
+    digits = f"{int(lat):02d}{int(latmin):02d}{round((latmin % 1) * 100):02d}"
+    ld = int(lon)
+    lm_f = (lon - ld) * 60.0
+    lm, lh = int(lm_f), round((lm_f - int(lm_f)) * 100)
+    offset = ld <= 9 or ld >= 100
+    dst = ""
+    for i, ch in enumerate(digits):
+        dig = int(ch)
+        up = (i < 3                              # standard msg bits
+              or (i == 3 and north)
+              or (i == 4 and offset)
+              or (i == 5 and west))
+        dst += chr((ord("P") if up else ord("0")) + dig)
+    if ld <= 9:
+        c_d = ld + 118                           # (ld+190) - 100 + 28
+    elif ld <= 99:
+        c_d = ld + 28
+    elif ld <= 109:
+        c_d = ld + 8                             # (ld-100+80) + 28
+    else:
+        c_d = ld - 72                            # (ld-100) + 28
+    c_m = lm + 88 if lm <= 9 else lm + 28
+    sp, rem = int(speed_kt) // 10, int(speed_kt) % 10
+    dc = rem * 10 + int(course) // 100
+    se = int(course) % 100
+    info = "`" + "".join(chr(c + 28) for c in
+                         (c_d - 28, c_m - 28, lh, sp, dc, se)) + symbol + table
+    return dst, info
+
+
+# ==========================================================================
+# skyTuna map emitter
+# ==========================================================================
+def emit_positions(frames, path=SKY_APRS, t=None):
+    """Append position-bearing frames to the sky panel's aprs.jsonl.
+    Schema (matches sky_panel LAYERS/TRACK_FIELDS): t, id, lat, lon,
+    src:"aprs" + optional speed_kt/course/alt_m/comment. Never the QTH."""
+    recs, seen = [], set()
+    for f in frames:
+        if f.get("lat") is None or f.get("lon") is None:
+            continue
+        key = (f["src"], f["lat"], f["lon"])
+        if key in seen:
+            continue
+        seen.add(key)
+        rec = {"t": round(t if t is not None else time.time(), 2),
+               "id": f["src"], "lat": f["lat"], "lon": f["lon"],
+               "src": "aprs"}
+        for k in ("speed_kt", "course", "alt_m", "comment"):
+            if f.get(k) is not None:
+                rec[k] = f[k]
+        recs.append(rec)
+    if recs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+    return len(recs)
 
 
 # ==========================================================================
@@ -271,6 +481,53 @@ def cmd_selftest(args):
     for f in frames[:2]:
         print(f"    {f['src']} > {f['dst']}: {f['info'][:60]}")
     ok &= hit
+
+    # [3] plain-text position decode off the same decoded frame
+    want = (38 + 52.30 / 60.0, -(77 + 2.00 / 60.0))
+    pf = next((f for f in frames if f.get("lat") is not None), None)
+    good = (pf is not None
+            and abs(pf["lat"] - want[0]) < 0.01
+            and abs(pf["lon"] - want[1]) < 0.01)
+    print(f"[3] uncompressed position decode: "
+          f"{'OK' if good else 'FAIL'}"
+          + (f"  ({pf['lat']:.5f},{pf['lon']:.5f})" if pf else "  (no pos)"))
+    ok &= good
+
+    # [4] timestamped '@' variant (parser-level; same position grammar)
+    tp = decode_position("APRS", "@092345z3852.30N/07702.00W>on time")
+    good = (tp is not None and abs(tp["lat"] - want[0]) < 0.01
+            and abs(tp["lon"] - want[1]) < 0.01)
+    print(f"[4] timestamped '@' position decode: {'OK' if good else 'FAIL'}")
+    ok &= good
+
+    # [5] MIC-E roundtrip through the full RF chain: known coords -> dest
+    # digits + info bytes -> AX.25 -> AFSK -> FM -> decode -> coords
+    m_lat, m_lon, m_spd, m_cse = 33.42733, -112.12417, 23, 251
+    dst, minfo = mice_encode(m_lat, m_lon, m_spd, m_cse)
+    frames = demod(synth_iq(build_ax25("N0CALL-7", dst, minfo)))
+    mf = next((f for f in frames if f.get("fmt") == "mice"), None)
+    good = (mf is not None
+            and abs(mf["lat"] - m_lat) < 0.01
+            and abs(mf["lon"] - m_lon) < 0.01
+            and mf["speed_kt"] == m_spd and mf["course"] == m_cse)
+    print(f"[5] MIC-E roundtrip (dest={dst}): {'OK' if good else 'FAIL'}"
+          + (f"  ({mf['lat']:.5f},{mf['lon']:.5f} "
+             f"{mf['speed_kt']}kt/{mf['course']}deg)" if mf else "  (no fix)"))
+    ok &= good
+
+    # [6] map emitter schema (temp file - never the real map feed here)
+    tmp = LAB / "aprs_emit_selftest.jsonl"
+    tmp.unlink(missing_ok=True)
+    n = emit_positions([{"src": "N0CALL-7", "lat": 33.42733,
+                         "lon": -112.12417, "speed_kt": 23, "course": 251}],
+                       path=tmp, t=1234.0)
+    rec = json.loads(tmp.read_text().strip()) if n else {}
+    tmp.unlink(missing_ok=True)
+    good = (n == 1 and rec.get("id") == "N0CALL-7"
+            and rec.get("src") == "aprs" and rec.get("t") == 1234.0
+            and rec.get("lat") == 33.42733 and rec.get("lon") == -112.12417)
+    print(f"[6] map emitter JSONL schema: {'OK' if good else 'FAIL'}")
+    ok &= good
     print("=" * 62)
     print("SELFTEST", "PASS" if ok else "FAIL")
     print("=" * 62)
@@ -343,9 +600,14 @@ def cmd_capture(args):
     for f in frames:
         seen.setdefault(f["src"], f)
     for src, f in seen.items():
-        print(f"    {src:<10} > {f['dst']:<8} {f['info'][:64]}")
+        pos = (f"  [{f['lat']:.5f},{f['lon']:.5f}]"
+               if f.get("lat") is not None else "")
+        print(f"    {src:<10} > {f['dst']:<8} {f['info'][:64]}{pos}")
     if not frames:
         print("    (none this window - APRS is bursty; try --secs 120+)")
+    n_emit = emit_positions(frames)
+    if n_emit:
+        print(f"[map] {n_emit} position(s) -> {SKY_APRS} (sky panel :8644)")
 
 
 def main():
