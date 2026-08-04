@@ -95,7 +95,8 @@ def detect_signals():
 STATE = {"center_khz": 14030.0, "tune_khz": 14030.0, "band": "20m", "mode": "CW",
          "ifgr": 30, "rfsel": 0, "running": True, "antenna": "Antenna C",
          "lock": "none", "err": "", "chlock": False, "lock_off": 0.0, "last_off": 0.0,
-         "cw_filter_hz": 400}   # CW filter half-width ±Hz (0 = WIDE); default = classic ±400
+         "cw_filter_hz": 400,   # CW filter half-width ±Hz (0 = WIDE); default = classic ±400
+         "delivery_pct": 0.0}   # capture-integrity dial: samples/(wall*fs), the no-lie gauge
 # center_khz = the SDR/display center (the window); tune_khz = the CURSOR (the
 # exact freq we decode/listen to, movable within the window, SDRuno-style).
 
@@ -645,6 +646,10 @@ class SDRWorker(threading.Thread):
         buf = np.empty(2 * 65536, np.int16)
         last_off = 0.0
         fails = 0
+        # capture-integrity dial (8/03): samples==wall*fs or the decoder is
+        # reading OUR seams as keying (W1AW 55 dB decoded to salad; every
+        # absurd live wpm was ~96-99 = the chop rate, not an operator).
+        dl_t0, dl_got, hb_t = time.time(), 0, 0.0
         while STATE["running"]:
             if radio_lock and radio_lock.should_yield():
                 break
@@ -660,6 +665,11 @@ class SDRWorker(threading.Thread):
                     break
                 continue
             fails = 0
+            dl_got += r.ret
+            now = time.time()
+            if now - dl_t0 >= 2.0:
+                STATE["delivery_pct"] = round(100.0 * dl_got / ((now - dl_t0) * FS), 1)
+                dl_t0, dl_got = now, 0
             iq = ((buf[0:2 * r.ret:2].astype(np.float32)
                    + 1j * buf[1:2 * r.ret:2].astype(np.float32)) / 32768.0).astype(np.complex64)
             ring_write(iq)                          # fast; decode happens off-thread
@@ -672,8 +682,9 @@ class SDRWorker(threading.Thread):
                     SPEC["noise_db"] = float(np.percentile(hi, 25)); SPEC["ts"] = time.time()
             if STATE["mode"] == "CW":
                 self._audio(iq)            # BFO follows the cursor (cur_off_hz)
-            if radio_lock:
-                radio_lock.heartbeat()
+            if radio_lock and now - hb_t >= 5.0:
+                hb_t = now                 # file I/O every 65 ms stalls the read
+                radio_lock.heartbeat()     # loop; TTL is 90 s - 5 s is plenty
         try:
             sdr.deactivateStream(st); sdr.closeStream(st); del sdr
         except Exception:
@@ -837,7 +848,8 @@ class H(BaseHTTPRequestHandler):
             with _lock:
                 self._send(json.dumps({**{k: STATE[k] for k in
                     ("center_khz", "tune_khz", "band", "mode", "ifgr", "running",
-                     "lock", "err", "chlock", "cw_filter_hz")}, "span": SPAN_KHZ,
+                     "lock", "err", "chlock", "cw_filter_hz",
+                     "delivery_pct")}, "span": SPAN_KHZ,
                     "decode": dict(DECODE), "bands": BANDS, "modes": MODES,
                     "transcript": list(TRANSCRIPT)[-14:],
                     "smeter": round(max(0, (SPEC["peak_db"] - SPEC["noise_db"])), 1)}))
@@ -1006,7 +1018,10 @@ class H(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8647)
+    ap.add_argument("--antenna", default=STATE["antenna"],
+                    help='RSPdx port, e.g. "Antenna A" (loop, HF) / "Antenna C" (discone)')
     args = ap.parse_args()
+    STATE["antenna"] = args.antenna
     os.environ["PATH"] = r"C:\Program Files\SDRplay\API\x64" + os.pathsep + os.environ.get("PATH", "")
     _load_log()
     SDRWorker().start()
