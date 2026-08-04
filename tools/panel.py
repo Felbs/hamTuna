@@ -770,7 +770,12 @@ class Classifier(threading.Thread):
             time.sleep(8)
             if STATE["mode"] != "CW":
                 continue
-            iq = ring_snapshot(8)
+            # 20 s of air, not 8 (8/04 live: the user's eyes kept finding
+            # fists the 8 s window missed - an op pausing between words
+            # doesn't blink enough in 8 s to pass the rhythm gates; eyes
+            # integrate the whole waterfall history. 20 s is the window the
+            # corpus validation actually proved.)
+            iq = ring_snapshot(20)
             if iq is None:
                 continue
             band = STATE["band"]
@@ -786,16 +791,20 @@ class Classifier(threading.Thread):
                         cands.append({"khz": khz, "snr": h["snr_db"]})
             except Exception:
                 pass
+            # judge each candidate on the FRESHEST 8 s: the 20 s window is for
+            # cw_map's rhythm search only - a 20 s eye smears shut under QSB
+            # (8/04: 26 carriers, all tagged data/busy, zero badges)
+            iq8 = iq[-int(8 * FS):]
             out = []
             for s in cands:
                 co = (s["khz"] - STATE["center_khz"]) * 1000.0
                 cw_ok, wpm, eye = False, 0, 0.0
                 try:
-                    ss = iq[:int(FS)]
+                    ss = iq8[:int(FS)]
                     n = np.arange(len(ss))
                     x = (ss * np.exp(-2j * np.pi * co / FS * n)).astype(np.complex64)
                     off = co + cw.find_offset(x, FS, 400)
-                    env, aud = envelope_locked(iq, off)
+                    env, aud = envelope_locked(iq8, off)
                     txt, info = cw.decode_env_auto(env, aud)
                     w = info.get("wpm", 0)
                     eye = cw_quality.eye_opening(env)[0]
@@ -1399,18 +1408,27 @@ let SIGS=[];   // latest classified signals - feeds the waterfall badges
 // Waterfall badges (8/04, user ask): a clickable tab floats right above each
 // detected Morse signal ON the waterfall - see code, click code, hear code.
 function renderBadges(){const bd=$('badges');if(!bd)return;
-  if(VC===null||VS===null){bd.innerHTML='';return;}
+  if(VC===null||VS===null){bd.innerHTML='';bd._key='';return;}
   const w=spec.clientWidth;
-  bd.innerHTML=SIGS.filter(x=>x.cw!==false).map(x=>{
+  const vis=SIGS.filter(x=>x.cw!==false);
+  // STABLE DOM (8/04, the real click bug): this runs from the draw loop
+  // several times a second - rebuilding innerHTML each pass destroys the
+  // badge mid-press, so human clicks mostly land on a corpse. Rebuild ONLY
+  // when the signal set changes; otherwise just slide the existing badges.
+  const key=vis.map(x=>x.khz.toFixed(2)+':'+x.cw).join('|');
+  if(key===bd._key){
+    for(const el of bd.children){
+      const px=(parseFloat(el.dataset.khz)-(VC-VS/2))/VS*w;
+      el.style.left=px.toFixed(0)+'px';
+      el.style.display=(px<14||px>w-14)?'none':'';}
+    return;}
+  bd._key=key;
+  bd.innerHTML=vis.map(x=>{
     const px=(x.khz-(VC-VS/2))/VS*w;
-    if(px<14||px>w-14)return '';
     const cls=x.cw===true?'sigbadge':'sigbadge cand';
     const txt=x.cw===true?('&#9679; CW '+(x.wpm||'')):'?';
-    // act on MOUSEDOWN + stop propagation: the waterfall's cursor-drag
-    // machinery grabs mousedown before a click can complete (8/04 user:
-    // clicking the badges "doesn't tune into them")
-    return `<span class="${cls}" style="left:${px.toFixed(0)}px" `+
-      `title="${x.khz.toFixed(2)} kHz - click to listen" `+
+    return `<span class="${cls}" data-khz="${x.khz}" style="left:${px.toFixed(0)}px;${(px<14||px>w-14)?'display:none;':''}" `+
+      `title="${x.khz.toFixed(2)} kHz &middot; ${x.snr||'?'} dB - click to listen" `+
       `onmousedown="event.stopPropagation();event.preventDefault();tune(${x.khz});">${txt}</span>`;}).join('');}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
