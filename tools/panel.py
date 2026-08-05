@@ -110,7 +110,7 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
           "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
 TRANSCRIPT = deque(maxlen=60)
-BUILD = "0804-jitterbuf"   # bump on UI changes: an OPEN tab keeps running its
+BUILD = "0804-livecode3"   # bump on UI changes: an OPEN tab keeps running its
 #   old JS across panel restarts, silently - the page compares this via /state
 #   and tells the user to refresh (8/04: six deploys, user tested stale code)
 AUDIO = deque(maxlen=AUD_FS * 45)      # streaming QUEUE - the wav handler DRAINS it
@@ -926,7 +926,12 @@ class EarsDecoder(threading.Thread):
                 ears = {"text": txt[-160:] if (3 <= w <= 45 and q > 0.45) else "",
                         "q": round(q, 2), "wpm": round(w, 1),
                         "tone_hz": round(tone),
-                        "elements": int(info.get("elements", 0))}
+                        "elements": int(info.get("elements", 0)),
+                        # tokens feed the live-code banner when the IQ lane
+                        # has none (8/04: ears copied a 30 wpm fist the IQ
+                        # lane read as noise); per-letter q dims weak letters
+                        "tokens": (info.get("tokens", [])[-64:]
+                                   if (3 <= w <= 45 and q > 0.30) else [])}
                 with _lock:
                     DECODE["ears"] = ears
             except Exception as e:
@@ -1197,6 +1202,13 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>hamTuna</title>
 .sigbadge{position:absolute;top:2px;transform:translateX(-50%);z-index:6;background:#0e2f16;color:#7dff9a;border:1px solid #2fa15a;border-radius:6px;padding:1px 7px;font-size:11px;line-height:1.5;cursor:pointer;white-space:nowrap;box-shadow:0 0 5px #0008}
 .sigbadge:hover{background:#17512a}
 .sigbadge.cand{color:#9aa;border-color:#456;background:#101820}
+#livecode{display:flex;gap:9px;overflow:hidden;justify-content:flex-end;align-items:flex-end;
+  padding:5px 10px;min-height:52px;background:#04120b;border-bottom:1px solid var(--hair);white-space:nowrap}
+.tok{display:inline-flex;flex-direction:column;align-items:center;flex:0 0 auto}
+.tok .m{color:var(--acc);font-size:12px;letter-spacing:2px;line-height:1.2}
+.tok .c{color:#fff;font-size:19px;font-weight:700;line-height:1.15}
+.tok.lowq .m{color:#2a6}.tok.lowq .c{color:var(--mut)}
+.tok.gap{min-width:14px}
 .curline::before{content:'';position:absolute;top:0;left:-5px;border-left:6px solid transparent;border-right:6px solid transparent;border-top:9px solid currentColor}
 .curline::after{content:'';position:absolute;bottom:0;left:-5px;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:9px solid currentColor}
 .zoomctl{position:absolute;top:8px;right:10px;display:flex;flex-direction:column;gap:5px;z-index:6}
@@ -1254,7 +1266,7 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
   <div class=sub>click a signal &rarr; snap to its peak</div>
 </div>
 <div class=wrap>
-  <div class=left><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div><div id=badges></div>
+  <div class=left><div id=livecode></div><canvas id=spec></canvas><canvas id=wf></canvas><div class=curline id=curline></div><div id=badges></div>
     <div class=zoomctl>
       <button onclick="zoomBy(0.6,0.5)" title="zoom in (narrower band)">+</button>
       <button onclick="zoomBy(1.7,0.5)" title="zoom out">&minus;</button>
@@ -1401,6 +1413,14 @@ async function refresh(){
   $('earsline').innerHTML=(e.text&&e.elements>=20)
     ?`<b>👂 what you're hearing:</b> ${e.text} <span class=sub>(~${e.wpm} wpm, tone ${e.tone_hz} Hz)</span>`
     :'<span class=sub>👂 ears lane: no readable Morse in the audio right now</span>';
+  // LIVE CODE banner (8/04, user design): dits/dahs on top, English right
+  // under, full width above the waterfall - newest letters on the right
+  const lc=$('livecode');
+  if(lc){const tk=(d.tokens&&d.tokens.length)?d.tokens:((d.ears||{}).tokens||[]);
+    lc.innerHTML=tk.length?tk.map(t=>
+      t.c===' '?'<span class="tok gap"><span class=m>&nbsp;</span><span class=c>&nbsp;</span></span>'
+      :`<span class="tok${(t.q||0)<0.35?' lowq':''}"><span class=m>${t.m}</span><span class=c>${t.c}</span></span>`).join('')
+    :'<span class=sub style="margin:auto">— live Morse appears here when a signal decodes: &middot;&mdash; on top, letters under —</span>';}
   $('hint').textContent=d.hint||'';
   // stale-tab guard: an open tab keeps its old JS across panel restarts
   if(!window._b1)window._b1=ST.build;
@@ -1472,10 +1492,13 @@ function renderBadges(){const bd=$('badges');if(!bd)return;
   // badge mid-press, so human clicks mostly land on a corpse. Rebuild ONLY
   // when the signal set changes; otherwise just slide the existing badges.
   const key=vis.map(x=>x.khz.toFixed(2)+':'+x.cw).join('|');
+  // badges sit just BELOW the live-code banner, never over it (8/04 user:
+  // the buttons were colliding with the Morse display)
+  const bt=((($('livecode')||{}).offsetHeight)||0)+3;
   if(key===bd._key){
     for(const el of bd.children){
       const px=(parseFloat(el.dataset.khz)-(VC-VS/2))/VS*w;
-      el.style.left=px.toFixed(0)+'px';
+      el.style.left=px.toFixed(0)+'px';el.style.top=bt+'px';
       el.style.display=(px<14||px>w-14)?'none':'';}
     return;}
   bd._key=key;
@@ -1483,7 +1506,7 @@ function renderBadges(){const bd=$('badges');if(!bd)return;
     const px=(x.khz-(VC-VS/2))/VS*w;
     const cls=x.cw===true?'sigbadge':'sigbadge cand';
     const txt=x.cw===true?('&#9679; CW '+(x.wpm||'')):'?';
-    return `<span class="${cls}" data-khz="${x.khz}" style="left:${px.toFixed(0)}px;${(px<14||px>w-14)?'display:none;':''}" `+
+    return `<span class="${cls}" data-khz="${x.khz}" style="left:${px.toFixed(0)}px;top:${bt}px;${(px<14||px>w-14)?'display:none;':''}" `+
       `title="${x.khz.toFixed(2)} kHz &middot; ${x.snr||'?'} dB - click to listen" `+
       `onmousedown="event.stopPropagation();event.preventDefault();tune(${x.khz});">${txt}</span>`;}).join('');}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
