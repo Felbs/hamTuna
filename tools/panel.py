@@ -110,7 +110,7 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
           "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
 TRANSCRIPT = deque(maxlen=60)
-BUILD = "0804-ears-badges"   # bump on UI changes: an OPEN tab keeps running its
+BUILD = "0804-jitterbuf"   # bump on UI changes: an OPEN tab keeps running its
 #   old JS across panel restarts, silently - the page compares this via /state
 #   and tells the user to refresh (8/04: six deploys, user tested stale code)
 AUDIO = deque(maxlen=AUD_FS * 45)      # streaming QUEUE - the wav handler DRAINS it
@@ -1133,14 +1133,35 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(_wav_header())
+            # jitter buffer (8/04, user: "a constant skip" during static): the
+            # old loop drained EVERYTHING every 50 ms and padded silence the
+            # moment production jitter left the queue empty - a ~15 Hz comb of
+            # gaps, most audible against noise. Now: build a 300 ms prebuffer,
+            # send fixed 100 ms chunks only when real audio is available, and
+            # pad only after a genuine gap (>=400 ms) to keep the player alive.
+            ch = AUD_FS // 10
+            with _alock:
+                AUDIO.clear()                      # fresh start, no stale backlog
+            t0 = time.time()
+            while STATE["running"] and time.time() - t0 < 3.0:
+                with _alock:
+                    if len(AUDIO) >= 3 * ch:
+                        break
+                time.sleep(0.05)
+            starve = 0
             while STATE["running"]:
                 with _alock:
-                    chunk = bytes(np.array(AUDIO, np.int16).tobytes()) if AUDIO else b""
-                    AUDIO.clear()
+                    n = len(AUDIO)
+                    take = min(n, 3 * ch) if n >= ch else 0
+                    chunk = (np.array([AUDIO.popleft() for _ in range(take)],
+                                      np.int16).tobytes() if take else b"")
                 if chunk:
+                    starve = 0
                     self.wfile.write(chunk)
                 else:
-                    self.wfile.write(b"\x00\x00" * (AUD_FS // 20))   # 50 ms silence keeps it flowing
+                    starve += 1
+                    if starve >= 8:
+                        self.wfile.write(b"\x00\x00" * ch)
                 time.sleep(0.05)
         except Exception:
             pass
