@@ -110,7 +110,7 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
           "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
 TRANSCRIPT = deque(maxlen=60)
-BUILD = "0804-livecode3"   # bump on UI changes: an OPEN tab keeps running its
+BUILD = "0805-ft8deck1"    # bump on UI changes: an OPEN tab keeps running its
 #   old JS across panel restarts, silently - the page compares this via /state
 #   and tells the user to refresh (8/04: six deploys, user tested stale code)
 AUDIO = deque(maxlen=AUD_FS * 45)      # streaming QUEUE - the wav handler DRAINS it
@@ -120,6 +120,9 @@ EARS_RING = deque(maxlen=AUD_FS * 45)  # rolling 45 s HISTORY for the ears lane 
 #   "filling 1058/120960" - and the drain also explains "barely audible":
 #   the stream pads silence whenever the queue runs dry)
 SIGLIST = {"band": None, "sigs": []}   # classifier's authoritative carrier list: [{khz,snr,cw,wpm}]
+FT8SIG = {"khz": None, "n": 0, "sync_db": 0.0, "ts": 0.0}  # FT8 waterhole probe
+#   (classifier thread): khz = the band's FT8 dial when slot-synced energy is
+#   present, n = distinct carriers seen — feeds the blue '● FT8 ×N' badge
 SCANNING = False                       # True while an all-bands scan is hopping (prevents overlap)
 SCANRES = {"running": False, "done": False, "results": [], "best": None,
            "at": None}                 # async scan progress/results, served in /state
@@ -391,62 +394,201 @@ def decode_cw(iq):
 FT8_DIAL_KHZ = {"160m": 1840.0, "80m": 3573.0, "60m": 5357.0, "40m": 7074.0,
                 "30m": 10136.0, "20m": 14074.0, "17m": 18100.0, "15m": 21074.0,
                 "12m": 24915.0, "10m": 28074.0, "6m": 50313.0}
-_FT8_LAST = {"slot": None}      # slot-dedupe: append a transcript line once per slot
+_FT8_LAST = {"slot": None, "res": None}   # one FULL decode per slot; ticks in
+#   between return the cached table (text='' so transcript/log never duplicate)
+
+# ── FT8 DIVERSITY UNION (task #54, proven overnight 8/04-05, lab/FT8_NIGHT_REPORT.md):
+# decode the SAME slot stock + time-shifted ±0.25/±0.5 s + freq-shifted ±1.5 Hz and
+# union the unique CRC-valid messages. Measured on 139 live cycles: union beats stock
+# every time it differs (101 wins / 0 losses); the wide-window variant lost, so it is
+# NOT shipped. Each decode is CRC-checked by jt9, so a union can only add truth.
+FT8_RUNS = [("A", 0.00, 0.0), ("Tm50", -0.50, 0.0), ("Tm25", -0.25, 0.0),
+            ("Tp25", 0.25, 0.0), ("Tp50", 0.50, 0.0),
+            ("Fm15", 0.00, -1.5), ("Fp15", 0.00, 1.5)]
+FT8_AUD = 12_000
+_ft8_taps = firwin(401, 3300.0 / (FT8_AUD / 2)).astype(np.float32)  # USB filter @12 kHz
+_FT8_SCRATCH = HERE.parent / "lab" / "ft8_panel_scratch"
+_FT8_MARK = re.compile(r"^\?$|^[aq]\d$")   # jt9 trailing confidence markers
+_FT8_POOL = None
+
+
+def _ft8_pool():
+    global _FT8_POOL
+    if _FT8_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _FT8_POOL = ThreadPoolExecutor(max_workers=4)
+    return _FT8_POOL
+
+
+def _ft8_norm(msg):
+    return " ".join(t for t in msg.split() if not _FT8_MARK.match(t))
+
+
+def _ft8_baseband(iq, off_hz, fs):
+    """16 s of IQ -> 12 kHz complex baseband with the FT8 dial at DC."""
+    from math import gcd
+    from scipy.signal import resample_poly
+    n = np.arange(len(iq), dtype=np.float64)
+    x = (iq * np.exp(-2j * np.pi * off_hz / fs * n)).astype(np.complex64)
+    g = gcd(FT8_AUD, int(fs))
+    return resample_poly(x, FT8_AUD // g, int(fs) // g).astype(np.complex64)
+
+
+def _ft8_wav(bb, tsh, fsh, path):
+    """15 s mono 12 kHz USB wav from the 16 s baseband (nominal slot = +0.5 s in)."""
+    import wave
+    x = bb
+    if fsh:
+        ph = 2 * np.pi * fsh / FT8_AUD * np.arange(len(bb), dtype=np.float64)
+        x = bb * np.exp(1j * ph).astype(np.complex64)
+    y = lfilter(_ft8_taps, 1.0, x).real
+    a0 = int(round((0.5 + tsh) * FT8_AUD))
+    seg = y[a0:a0 + 15 * FT8_AUD]
+    seg = seg / (np.max(np.abs(seg)) + 1e-9) * 0.7
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(FT8_AUD)
+        w.writeframes((seg * 32767.0).astype(np.int16).tobytes())
+
+
+def _ft8_jt9(rid, wname):
+    """One jt9 run in its own rundir; stdout to a FILE so a timeout can't eat
+    output (the 8/04 harness law). Returns parsed {snr,dt,audio_hz,msg} records."""
+    import subprocess
+    import ft8_live
+    rd = _FT8_SCRATCH / f"run_{rid}"
+    outf = rd / "jt9_out.txt"
+    recs = []
+    try:
+        with open(outf, "w") as f:
+            p = subprocess.Popen([ft8_live.JT9, "-8", "-d", "3", wname],
+                                 cwd=str(rd), stdout=f, stderr=subprocess.STDOUT)
+            try:
+                p.wait(40)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                return []
+        for ln in outf.read_text(errors="replace").splitlines():
+            m = ft8_live._LINE.match(ln.strip())
+            if m:
+                msg = _ft8_norm(m.group(5))
+                if msg:
+                    recs.append({"snr": int(m.group(2)), "dt": float(m.group(3)),
+                                 "audio_hz": int(m.group(4)), "msg": msg})
+    except Exception:
+        pass
+    return recs
+
+
+def ft8_union_decode(iq16, fs, off_hz, t_slot=None):
+    """The shipped FT8 decode path: 7 diversity variants of the SAME 16 s of IQ
+    (starting 0.5 s BEFORE the slot edge) through jt9, unioned by unique message
+    (call/grid derive from the message, so message identity IS (call,grid,msg)).
+    Returns (records-sorted-by-snr, n_stock). Pure function — bench-replayable."""
+    import datetime as _dt
+    import ft8_live
+    _FT8_SCRATCH.mkdir(parents=True, exist_ok=True)
+    # jt9 parses HHMMSS from the 6 chars before '.wav' — keep the harness naming
+    wname = _dt.datetime.fromtimestamp(t_slot or time.time(), _dt.timezone.utc
+                                       ).strftime("%y%m%d_%H%M%S") + ".wav"
+    wisdom = HERE / "jt9_wisdom.dat"
+    bb = _ft8_baseband(iq16, off_hz, fs)
+    futs = {}
+    for rid, tsh, fsh in FT8_RUNS:
+        rd = _FT8_SCRATCH / f"run_{rid}"
+        rd.mkdir(parents=True, exist_ok=True)
+        if wisdom.exists() and not (rd / "jt9_wisdom.dat").exists():
+            (rd / "jt9_wisdom.dat").write_bytes(wisdom.read_bytes())
+        _ft8_wav(bb, tsh, fsh, rd / wname)
+        futs[rid] = _ft8_pool().submit(_ft8_jt9, rid, wname)
+    res = {rid: f.result() for rid, f in futs.items()}
+    for rid, *_ in FT8_RUNS:
+        try:
+            (_FT8_SCRATCH / f"run_{rid}" / wname).unlink()
+        except OSError:
+            pass
+    best = {}
+    for rid, recs in res.items():
+        for r in recs:
+            b = best.get(r["msg"])
+            if b is None:
+                b = dict(r); b["conds"] = set(); best[r["msg"]] = b
+            elif r["snr"] > b["snr"]:
+                b.update({k: r[k] for k in ("snr", "dt", "audio_hz")})
+            b["conds"].add(rid)
+    out = []
+    for m in sorted(best, key=lambda m: -best[m]["snr"]):
+        r = best[m]
+        g = ft8_live._GRID.search(m)
+        out.append({"snr": r["snr"], "dt": r["dt"], "audio_hz": r["audio_hz"],
+                    "msg": m, "calls": ft8_live._CALL.findall(m),
+                    "grid": g.group(1) if g else None,
+                    "conds": sorted(r["conds"])})
+    return out, len({r["msg"] for r in res.get("A", [])})
 
 
 def decode_ft8(iq):
-    """FT8 via the jt9 engine-adapter (ft8_live.py). FT8 transmissions start on
-    :00/:15/:30/:45 UTC, so we cut the 15 s window aligned to the last completed
-    slot that fits in the ring (jt9's own +/-2.4 s dt search covers the residual);
-    mix the band's FT8 dial to baseband; run jt9; return the decodes. Only emits a
-    transcript line ONCE per slot (the decoder thread re-runs faster than 15 s)."""
+    """FT8 deck decode: slice the last COMPLETED :00/:15/:30/:45 UTC slot out of
+    the SAME 250 kHz ring the waterfall runs on (the waterhole rides inside the
+    window on every BANDS entry — no second SDR session, ever), then run the
+    proven diversity union. One full decode per slot; between slots the cached
+    table is returned with text='' so transcript/logbook never double-count."""
     import datetime
     import ft8_live
     band = STATE.get("band", "20m")
     dial = FT8_DIAL_KHZ.get(band)
-    empty = {"text": "", "q": 0.0, "conf": 0.0, "wpm": 0, "n": 0,
-             "decodes": [], "lines": [], "calls": [], "grids": []}
+    empty = {"text": "", "q": 0.0, "conf": 0.0, "wpm": 0, "n": 0, "n_stock": 0,
+             "decodes": [], "lines": [], "calls": [], "grids": [], "gridmap": {},
+             "slot_utc": ""}
     if dial is None:
         return {**empty, "offset_hz": 0,
                 "hint": f"no FT8 dial for {band} — try 20m/40m/30m/…"}
     off = (dial - STATE["center_khz"]) * 1000.0          # Hz: capture center -> FT8 dial
+    if abs(off) > FS / 2 - 4000.0:
+        return {**empty, "offset_hz": round(off),
+                "hint": f"FT8 waterhole {dial:.0f} kHz sits outside this 250 kHz window"}
+    if not Path(ft8_live.JT9).exists():
+        return {**empty, "offset_hz": round(off),
+                "hint": "jt9.exe not found — install WSJT-X at C:\\wsjtx"}
     fs = FS
     total_s = len(iq) / fs
     now = datetime.datetime.now(datetime.timezone.utc)
-    into = (now.second % 15) + now.microsecond / 1e6     # seconds into the current slot
-    start_s = total_s - into - 15.0                      # window start, seconds from buffer head
-    if start_s >= 0:
-        a = int(start_s * fs)
-        seg, aligned = iq[a:a + int(15 * fs)], True
-    else:
-        seg, aligned = iq[-int(15 * fs):], False         # fallback: last 15 s
-    if len(seg) < int(14 * fs):
+    into = now.timestamp() % 15.0                        # seconds into the current slot
+    slot_key = int(now.timestamp() // 15) - 1            # last COMPLETED slot
+    if slot_key == _FT8_LAST["slot"] and _FT8_LAST["res"] is not None:
+        return {**_FT8_LAST["res"], "text": ""}          # cached — decode once per slot
+    start_s = total_s - into - 15.5                      # slot start -0.5 s (time-shift margin)
+    if start_s < 0:
         return {**empty, "offset_hz": round(off),
-                "hint": "buffer too short for a 15 s FT8 slot"}
-    slot_key = int((now.timestamp() - into) // 15)
-    new_slot = slot_key != _FT8_LAST["slot"]
-    _FT8_LAST["slot"] = slot_key
-    wav = HERE.parent / "lab" / "_ft8_panel.wav"
-    wav.parent.mkdir(exist_ok=True)
-    ft8_live.iq_to_wav(seg.astype(np.complex64), None, wav, off_hz=off, fs=fs)
-    recs, err = ft8_live.decode_wav(wav)
-    if err:
-        return {**empty, "offset_hz": round(off), "hint": err[:80]}
-    calls, grids = [], []
+                "hint": "ring filling — first FT8 table in ≲30 s"}
+    a = int(start_s * fs)
+    seg = iq[a:a + int(16 * fs)]
+    if len(seg) < int(15.5 * fs):
+        return {**empty, "offset_hz": round(off),
+                "hint": "buffer too short for a 16 s FT8 slice"}
+    t_slot = now.timestamp() - into - 15.0
+    recs, n_stock = ft8_union_decode(seg, fs, off, t_slot)
+    calls, grids, gridmap = [], [], {}
     for r in recs:
         for c in r.get("calls", []):
             if c not in calls:
                 calls.append(c)
-        if r.get("grid") and r["grid"] not in grids:
-            grids.append(r["grid"])
-    lines = [f"{r['snr']:+3d} {r['msg']}" for r in recs[:12]]
-    text = " / ".join(r["msg"] for r in recs[:8]) if (recs and new_slot) else ""
+        if r.get("grid"):
+            if r["grid"] not in grids:
+                grids.append(r["grid"])
+            if r.get("calls"):                 # standard msg: '... SENDER GRID'
+                gridmap.setdefault(r["calls"][-1], r["grid"])
+    lines = [f"{r['snr']:+3d} {r['msg']}" for r in recs[:24]]
+    text = " / ".join(r["msg"] for r in recs[:8]) if recs else ""
     hint = "" if recs else "no FT8 decodes this slot (need a live signal on the dial)"
-    return {"text": text, "q": 1.0 if recs else 0.0,
-            "conf": round(min(1.0, len(recs) / 5.0), 2), "wpm": 0,
-            "offset_hz": round(off), "n": len(recs), "decodes": recs[:12],
-            "lines": lines, "calls": calls, "grids": grids,
-            "aligned": aligned, "hint": hint}
+    res = {"text": text, "q": 1.0 if recs else 0.0,
+           "conf": round(min(1.0, len(recs) / 5.0), 2), "wpm": 0,
+           "offset_hz": round(off), "n": len(recs), "n_stock": n_stock,
+           "decodes": recs[:24], "lines": lines, "calls": calls, "grids": grids,
+           "gridmap": gridmap, "hint": hint,
+           "slot_utc": datetime.datetime.fromtimestamp(
+               t_slot, datetime.timezone.utc).strftime("%H:%M:%S") + "Z"}
+    _FT8_LAST.update(slot=slot_key, res=res)
+    return res
 
 
 DECODERS = {"CW": decode_cw, "FT8": decode_ft8}
@@ -503,23 +645,33 @@ def _save_log():
         pass
 
 
-def log_calls(calls, band, khz, snr):
-    """Log heard calls as PENDING (0 pts). Points come only after the verifier
-    confirms the call is a real ham — a decode artifact that matches the pattern
-    but isn't a licensed call never scores."""
+def log_calls(calls, band, khz, snr, mode="CW", grids=None):
+    """Log heard calls. CW calls land PENDING (0 pts) — points only after the
+    verifier confirms a real ham (a decode artifact never scores). FT8 calls are
+    CRC-certain (jt9's CRC makes every decode ground truth), so they log verified
+    immediately BUT score lower — the Morse chase stays special (user decision):
+    CW 10 base / +3 per band vs FT8 4 base / +1 per band. `grids` maps call ->
+    Maidenhead grid from the FT8 message; stored on the record."""
     new = []
     for c in calls:
         if c in LOGBOOK:
-            LOGBOOK[c]["count"] += 1
-            if band not in LOGBOOK[c]["bands"]:
-                LOGBOOK[c]["bands"].append(band)
-                if LOGBOOK[c].get("verified"):
-                    LOGBOOK[c]["points"] += 3        # new band on a real call
+            r = LOGBOOK[c]
+            r["count"] += 1
+            if grids and grids.get(c) and not r.get("grid"):
+                r["grid"] = grids[c]
+            if band not in r["bands"]:
+                r["bands"].append(band)
+                if r.get("verified"):
+                    r["points"] += 3 if r.get("mode", "CW") == "CW" else 1
         else:
-            LOGBOOK[c] = {"call": c, "first": time.strftime("%Y-%m-%d %H:%M"),
-                          "bands": [band], "khz": khz, "count": 1, "snr": snr,
-                          "verified": None, "name": "", "qth": "", "points": 0,
-                          "tries": 0}
+            r = {"call": c, "first": time.strftime("%Y-%m-%d %H:%M"),
+                 "bands": [band], "khz": khz, "count": 1, "snr": snr,
+                 "verified": None, "name": "", "qth": "", "points": 0,
+                 "tries": 0, "mode": mode, "grid": (grids or {}).get(c, "")}
+            if mode == "FT8":
+                r["verified"] = True   # CRC-valid = certain; skip hamdb round-trips
+                r["points"] = 4
+            LOGBOOK[c] = r
             new.append(c)
     if new:
         _save_log()
@@ -717,7 +869,10 @@ class Decoder(threading.Thread):
             time.sleep(DECODE_EVERY)
             if not STATE["running"] or STATE["mode"] not in DECODERS:
                 continue
-            iqd = ring_snapshot(DECODE_SECS)
+            # FT8 needs the FULL 30 s ring: the slot slice starts up to
+            # (seconds-into-slot + 15.5) s back, which can exceed DECODE_SECS
+            # when a union decode overruns a slot boundary.
+            iqd = ring_snapshot(30 if STATE["mode"] == "FT8" else DECODE_SECS)
             if iqd is None:
                 continue
             try:
@@ -743,9 +898,10 @@ class Decoder(threading.Thread):
                         with _lock:
                             DECODE["new_calls"] = got
                 elif res.get("text") and res["mode"] == "FT8" and res.get("calls"):
-                    # FT8 carries verified callsigns directly (structured) - log them
+                    # FT8 carries CRC-certain callsigns directly (structured) - log
                     # once per slot (text is only set on a new slot, so this dedupes).
-                    got = log_calls(res["calls"], STATE["band"], STATE["center_khz"], snr)
+                    got = log_calls(res["calls"], STATE["band"], STATE["center_khz"], snr,
+                                    mode="FT8", grids=res.get("gridmap"))
                     if got:
                         res["new_calls"] = got
                         with _lock:
@@ -768,15 +924,76 @@ class Verifier(threading.Thread):
                 pass
 
 
+def _ft8_probe(iq):
+    """FT8 positive ID for the badge (task #54): energy in the band's waterhole
+    (dial..dial+3.1 kHz) that switches ON/OFF synchronized to the 15 s UTC slots.
+    FT8 transmits ~0.5-13.1 s into each slot, then the whole waterhole goes quiet
+    until the next edge — that dead-air window is the fingerprint no broadcast
+    carrier or CW pileup shares. Simple by design: mix waterhole center down,
+    decimate, 0.1 s power frames, compare on-window vs gap-window energy across
+    the 20 s snapshot; count carriers only when the slot-sync gate passes."""
+    band = STATE["band"]
+    dial = FT8_DIAL_KHZ.get(band)
+    if dial is None:
+        FT8SIG.update(khz=None, n=0, sync_db=0.0, ts=time.time())
+        return
+    off = (dial - STATE["center_khz"]) * 1000.0
+    if abs(off) > FS / 2 - 4000.0:                 # waterhole outside the window
+        FT8SIG.update(khz=None, n=0, sync_db=0.0, ts=time.time())
+        return
+    from scipy.signal import resample_poly
+    n = np.arange(len(iq), dtype=np.float64)
+    x = (iq * np.exp(-2j * np.pi * (off + 1550.0) / FS * n)).astype(np.complex64)
+    xr = resample_poly(x, 1, 64)                   # 3906 Hz: ±1.95 kHz around waterhole center
+    fs2 = FS / 64.0
+    now = time.time()
+    k = int(fs2 * 0.1)
+    m = len(xr) // k
+    if m < 60:                                     # need most of the 20 s snapshot
+        return
+    p = (np.abs(xr[:m * k]) ** 2).reshape(m, k).mean(1)
+    ph = np.mod(now - (m - np.arange(m) - 0.5) * 0.1, 15.0)   # frame center, s into slot
+    on, gap = p[(ph >= 1.0) & (ph <= 12.5)], p[(ph >= 13.6) & (ph <= 14.8)]
+    if len(on) < 10 or len(gap) < 5:
+        return
+    sync = 10.0 * np.log10((float(np.mean(on)) + 1e-12) / (float(np.mean(gap)) + 1e-12))
+    nsig = 0
+    if sync >= 5.0:                                # slot-synced energy = FT8 present
+        N = 1024
+        seg = xr[:len(xr) // N * N].reshape(-1, N) * np.hanning(N).astype(np.float32)
+        P = (np.abs(np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1)) ** 2).mean(0)
+        Pdb = 10.0 * np.log10(P + 1e-12)
+        thr = float(np.median(Pdb)) + 8.0
+        skip = max(1, int(50.0 / (fs2 / N)))       # one FT8 signal ≈ 50 Hz wide
+        i = 1
+        while i < N - 1:
+            if Pdb[i] > thr and Pdb[i] >= Pdb[i - 1] and Pdb[i] > Pdb[i + 1]:
+                nsig += 1
+                i += skip
+            else:
+                i += 1
+    FT8SIG.update(khz=dial if nsig else None, n=int(nsig),
+                  sync_db=round(float(sync), 1), ts=time.time())
+
+
 class Classifier(threading.Thread):
     """Off-thread: probe each detected carrier and tag whether it's actually
     copyable CW (valid WPM + real text) vs data/QSB/machine-CW — so the signal
-    list tells you what you can READ, not just what's loud."""
+    list tells you what you can READ, not just what's loud. Also runs the cheap
+    FT8 waterhole probe (badge fuel) on the same snapshot in CW and FT8 modes."""
     daemon = True
 
     def run(self):
         while True:
             time.sleep(8)
+            if STATE["mode"] not in ("CW", "FT8"):
+                continue
+            iqf = ring_snapshot(20)
+            if iqf is not None:
+                try:
+                    _ft8_probe(iqf)                # never let the probe kill the thread
+                except Exception:
+                    pass
             if STATE["mode"] != "CW":
                 continue
             # 20 s of air, not 8 (8/04 live: the user's eyes kept finding
@@ -784,7 +1001,7 @@ class Classifier(threading.Thread):
             # doesn't blink enough in 8 s to pass the rhythm gates; eyes
             # integrate the whole waterfall history. 20 s is the window the
             # corpus validation actually proved.)
-            iq = ring_snapshot(20)
+            iq = iqf                    # same 20 s snapshot the FT8 probe used
             if iq is None:
                 continue
             band = STATE["band"]
@@ -1105,6 +1322,7 @@ class H(BaseHTTPRequestHandler):
                 for s in sigs:
                     s["cw"] = None; s["wpm"] = 0
             self._send(json.dumps({"signals": sigs,
+                                   "ft8": (dict(FT8SIG) if FT8SIG["khz"] else None),
                                    "center": STATE["center_khz"], "tune": STATE["tune_khz"]}))
         elif u.path == "/log":
             self._send(json.dumps(log_summary()))
@@ -1202,6 +1420,14 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>hamTuna</title>
 .sigbadge{position:absolute;top:2px;transform:translateX(-50%);z-index:6;background:#0e2f16;color:#7dff9a;border:1px solid #2fa15a;border-radius:6px;padding:1px 7px;font-size:11px;line-height:1.5;cursor:pointer;white-space:nowrap;box-shadow:0 0 5px #0008}
 .sigbadge:hover{background:#17512a}
 .sigbadge.cand{color:#9aa;border-color:#456;background:#101820}
+.sigbadge.ft8{color:#6db3ff;border-color:#2a5ca8;background:#0b1e3a}
+.sigbadge.ft8:hover{background:#14315e}
+.ft8wrap{background:#000;border:1px solid var(--hair);border-radius:8px;max-height:220px;overflow-y:auto}
+.ft8tab{width:100%;border-collapse:collapse;font-size:12px}
+.ft8tab th{position:sticky;top:0;background:#0b141c;color:var(--mut);text-align:left;padding:4px 8px;font-weight:400;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+.ft8tab td{padding:3px 8px;border-bottom:1px solid #0b141c;white-space:nowrap}
+.ft8tab td.fcall{color:#6db3ff;font-weight:700}.ft8tab td.fgrid{color:var(--good)}
+.ft8tab td.fdb{text-align:right;color:var(--mut)}.ft8tab td.fmsg{color:var(--ink)}
 #livecode{display:flex;gap:9px;overflow:hidden;justify-content:flex-end;align-items:flex-end;
   padding:5px 10px;min-height:52px;background:#04120b;border-bottom:1px solid var(--hair);white-space:nowrap}
 .tok{display:inline-flex;flex-direction:column;align-items:center;flex:0 0 auto}
@@ -1310,7 +1536,11 @@ button.step{padding:2px 9px;font-size:13px;font-weight:700}
       <div class=smeter><div class=sfill id=smbar style=width:0%></div></div>
     </div>
     <div><div class=lbl id=declbl>Live Morse transcript</div><div class=xscript id=xscript></div>
-    <div id=earsline style="margin-top:6px;padding:8px;border:1px dashed var(--hair);border-radius:8px;font-size:14px"></div></div>
+    <div id=earsline style="margin-top:6px;padding:8px;border:1px dashed var(--hair);border-radius:8px;font-size:14px"></div>
+    <div id=ft8pane style="display:none">
+      <div class=ft8wrap><table class=ft8tab><thead><tr><th>call</th><th>grid</th><th>dB</th><th>message</th></tr></thead><tbody id=ft8rows></tbody></table></div>
+      <div class=sub id=ft8meta style="margin-top:4px"></div>
+    </div></div>
     <div class=newcall id=newcall></div>
     <div class=logbook>
       <div class=lbl style="display:flex;justify-content:space-between;align-items:baseline">
@@ -1398,15 +1628,29 @@ async function refresh(){
   for(const v of [0,400,250,150]){const b=$('fb'+v);if(b)b.classList.toggle('on',fhz===v);}
   $('wpm').textContent=d.wpm?d.wpm.toFixed(1):'—';
   $('sm').textContent=(ST.smeter||0).toFixed(0)+' dB';$('smbar').style.width=Math.min(100,(ST.smeter||0)*2.2)+'%';
-  $('declbl').textContent=ST.mode==='CW'?'Live Morse transcript':ST.mode+' decode';
-  const xs=$('xscript');
-  if(ST.mode==='CW'){
-    const tr=ST.transcript||[];    // rolling history so intermittent copy accumulates & stays visible
-    const mstyle='display:block;font-family:monospace;opacity:.5;font-size:.8em;letter-spacing:2px;margin-bottom:4px';
-    xs.innerHTML = tr.length ? tr.map(x=>`<span class=xline>${x.text}${(ST.showmorse!==false&&x.morse)?`<span style="${mstyle}">${x.morse}</span>`:''} </span>`).join('')
-                  : (d.text?`<span class=xline>${d.text}</span>`:'<div class=sub>…listening for CW…</div>');
-    xs.scrollTop=xs.scrollHeight;
-  } else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
+  // the bottom pane TRANSFORMS by mode (8/04 locked design): CW = the classic
+  // transcript+ears flow, FT8 = the decode table (fed per 15 s UTC slot), one
+  // waterfall above either way — live air never gets its own tab.
+  $('declbl').textContent=ST.mode==='CW'?'Live Morse transcript'
+    :(ST.mode==='FT8'?('FT8 deck — slot '+(d.slot_utc||'…')):ST.mode+' decode');
+  const xs=$('xscript'),fp=$('ft8pane'),el=$('earsline');
+  if(ST.mode==='FT8'){
+    xs.style.display='none';el.style.display='none';fp.style.display='block';
+    $('ft8rows').innerHTML=(d.decodes&&d.decodes.length)?d.decodes.map(r=>{
+      const c=(r.calls&&r.calls.length)?r.calls[r.calls.length-1]:'—';
+      return `<tr><td class=fcall>${c}</td><td class=fgrid>${r.grid||''}</td><td class=fdb>${r.snr>0?'+':''}${r.snr}</td><td class=fmsg>${r.msg}</td></tr>`;}).join('')
+      :`<tr><td colspan=4 class=sub style="padding:8px">${d.hint||'…listening for the next 15 s slot…'}</td></tr>`;
+    $('ft8meta').textContent=d.n?(d.n+' decodes this slot (stock '+(d.n_stock!=null?d.n_stock:'?')+' + diversity union)'):'';
+  }else{
+    xs.style.display='';el.style.display='';fp.style.display='none';
+    if(ST.mode==='CW'){
+      const tr=ST.transcript||[];    // rolling history so intermittent copy accumulates & stays visible
+      const mstyle='display:block;font-family:monospace;opacity:.5;font-size:.8em;letter-spacing:2px;margin-bottom:4px';
+      xs.innerHTML = tr.length ? tr.map(x=>`<span class=xline>${x.text}${(ST.showmorse!==false&&x.morse)?`<span style="${mstyle}">${x.morse}</span>`:''} </span>`).join('')
+                    : (d.text?`<span class=xline>${d.text}</span>`:'<div class=sub>…listening for CW…</div>');
+      xs.scrollTop=xs.scrollHeight;
+    } else xs.innerHTML='<div class=sub>'+ST.mode+' decode coming soon — spectrum + audio live</div>';
+  }
   // EARS lane: decodes exactly the audio you are hearing (the referee when
   // the live lane shows nothing but your ears clearly copy Morse)
   const e=d.ears||{};
@@ -1436,7 +1680,7 @@ async function pollLog(){let s;try{s=await api('/log');}catch(e){return;}
     `<span title="bands worked">📶 ${st.bands||0} bands</span>`+
     `<span title="US states worked (WAS)">🗺️ ${st.states||0} states</span>`;
   $('loglist').innerHTML=(s.calls||[]).length?(s.calls).map(c=>
-    `<div class=logrow><span class=call>&check; ${c.call}</span><span class=meta>${(c.name||'').split(' ')[0]} &middot; ${c.bands.join('/')} &middot; ${c.points}pt</span></div>`).join('')
+    `<div class=logrow><span class=call>&check; ${c.call}${c.mode==='FT8'?' <small style="color:#6db3ff;font-weight:400">FT8</small>':''}</span><span class=meta>${c.mode==='FT8'?(c.grid||''):(c.name||'').split(' ')[0]} &middot; ${c.bands.join('/')} &middot; ${c.points}pt</span></div>`).join('')
     :'<div class=sub>no verified calls yet — tune in a CQ</div>';}
 async function set(kv){await api('/set?'+kv);refresh();}
 async function autotune(){
@@ -1480,7 +1724,13 @@ async function step(d){await api('/step?d='+(d>0?1:0));refresh();}
 async function togLock(){await api('/lock?on='+(ST.chlock?0:1));refresh();}
 async function tune(khz){await api('/tune?khz='+khz);refresh();}
 async function setFilt(hz){await api('/cwfilter?hz='+hz);refresh();}
+// badge clicks TRANSFORM the bottom pane (8/04 locked design): CW badge -> the
+// classic audio+banner+transcript flow, FT8 badge -> the decode table. Mode
+// follows the badge the user clicked; tune lands the cursor on the signal.
+async function cwgo(khz){if(ST.mode!=='CW')await api('/set?mode=CW');tune(khz);}
+async function ft8go(dial){if(ST.mode!=='FT8')await api('/set?mode=FT8');tune(dial);}
 let SIGS=[];   // latest classified signals - feeds the waterfall badges
+let FT8B=null; // FT8 waterhole probe result - feeds the blue FT8 badge
 // Waterfall badges (8/04, user ask): a clickable tab floats right above each
 // detected Morse signal ON the waterfall - see code, click code, hear code.
 function renderBadges(){const bd=$('badges');if(!bd)return;
@@ -1491,7 +1741,7 @@ function renderBadges(){const bd=$('badges');if(!bd)return;
   // several times a second - rebuilding innerHTML each pass destroys the
   // badge mid-press, so human clicks mostly land on a corpse. Rebuild ONLY
   // when the signal set changes; otherwise just slide the existing badges.
-  const key=vis.map(x=>x.khz.toFixed(2)+':'+x.cw).join('|');
+  const key=vis.map(x=>x.khz.toFixed(2)+':'+x.cw).join('|')+(FT8B?('|F'+FT8B.khz+':'+FT8B.n):'');
   // badges sit just BELOW the live-code banner, never over it (8/04 user:
   // the buttons were colliding with the Morse display)
   const bt=((($('livecode')||{}).offsetHeight)||0)+3;
@@ -1502,16 +1752,22 @@ function renderBadges(){const bd=$('badges');if(!bd)return;
       el.style.display=(px<14||px>w-14)?'none':'';}
     return;}
   bd._key=key;
-  bd.innerHTML=vis.map(x=>{
+  let html=vis.map(x=>{
     const px=(x.khz-(VC-VS/2))/VS*w;
     const cls=x.cw===true?'sigbadge':'sigbadge cand';
     const txt=x.cw===true?('&#9679; CW '+(x.wpm||'')):'?';
     return `<span class="${cls}" data-khz="${x.khz}" style="left:${px.toFixed(0)}px;top:${bt}px;${(px<14||px>w-14)?'display:none;':''}" `+
       `title="${x.khz.toFixed(2)} kHz &middot; ${x.snr||'?'} dB - click to listen" `+
-      `onmousedown="event.stopPropagation();event.preventDefault();tune(${x.khz});">${txt}</span>`;}).join('');}
+      `onmousedown="event.stopPropagation();event.preventDefault();cwgo(${x.khz});">${txt}</span>`;}).join('');
+  if(FT8B&&FT8B.n>0){    // blue badge mid-waterhole (dial +1.5 kHz = signal center)
+    const fk=FT8B.khz+1.5, px=(fk-(VC-VS/2))/VS*w;
+    html+=`<span class="sigbadge ft8" data-khz="${fk}" style="left:${px.toFixed(0)}px;top:${bt}px;${(px<14||px>w-14)?'display:none;':''}" `+
+      `title="FT8 waterhole ${FT8B.khz.toFixed(0)} kHz &middot; slot-synced &middot; click for the decode table" `+
+      `onmousedown="event.stopPropagation();event.preventDefault();ft8go(${FT8B.khz});">&#9679; FT8 &times;${FT8B.n}</span>`;}
+  bd.innerHTML=html;}
 async function pollSignals(){let s;try{s=await api('/signals');}catch(e){return;}
   const list=$('siglist'),sigs=s.signals||[],c=s.center;
-  SIGS=sigs;renderBadges();
+  SIGS=sigs;FT8B=s.ft8||null;renderBadges();
   // copyable CW floats to the TOP of the list (8/04 user: had to scroll to
   // the bottom to find the one illuminated row); then candidates, data last
   sigs.sort((a,b)=>((b.cw===true)-(a.cw===true))||((a.cw===false)-(b.cw===false))||(b.eye||0)-(a.eye||0));
