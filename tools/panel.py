@@ -110,6 +110,9 @@ DECODE = {"text": "", "wpm": 0.0, "q": 0.0, "conf": 0.0, "elements": 0,
           "mode": "CW", "ts": 0.0, "hint": "", "offset_hz": 0.0,
           "eye_q": 0.0, "eye_db": 0.0, "copy_pct": 0, "verdict": "—", "route": "classic"}
 TRANSCRIPT = deque(maxlen=60)
+BUILD = "0804-ears-badges"   # bump on UI changes: an OPEN tab keeps running its
+#   old JS across panel restarts, silently - the page compares this via /state
+#   and tells the user to refresh (8/04: six deploys, user tested stale code)
 AUDIO = deque(maxlen=AUD_FS * 45)      # streaming QUEUE - the wav handler DRAINS it
 EARS_RING = deque(maxlen=AUD_FS * 45)  # rolling 45 s HISTORY for the ears lane -
 #   separate from AUDIO on purpose: the streamer clears AUDIO every 50 ms, so a
@@ -793,8 +796,13 @@ class Classifier(threading.Thread):
             try:
                 for h in cw_map.cw_map(iq, FS, top=12):
                     khz = round(STATE["center_khz"] + h["khz_off"], 3)
-                    if all(abs(khz - c["khz"]) > 0.3 for c in cands):
-                        cands.append({"khz": khz, "snr": h["snr_db"]})
+                    hit = next((c for c in cands
+                                if abs(khz - c["khz"]) <= 0.3), None)
+                    if hit is None:
+                        cands.append({"khz": khz, "snr": h["snr_db"],
+                                      "map": True})
+                    else:
+                        hit["map"] = True   # loud carrier WITH keying rhythm
             except Exception:
                 pass
             # judge each candidate on the FRESHEST 8 s: the 20 s window is for
@@ -822,7 +830,13 @@ class Classifier(threading.Thread):
                     wpm = round(float(w), 1) if cw_ok else 0
                 except Exception:
                     pass
-                out.append({"khz": s["khz"], "snr": s["snr"], "cw": cw_ok,
+                # three honest tiers, not two (8/04: the user was LISTENING to
+                # partial Morse while zero badges showed): True = the decoder
+                # copies it; None = keying RHYTHM seen (cw_map) but not clean
+                # copy - a human may still enjoy it, badge it '?'; False = no
+                # evidence of Morse at all.
+                tier = True if cw_ok else (None if s.get("map") else False)
+                out.append({"khz": s["khz"], "snr": s["snr"], "cw": tier,
                             "wpm": wpm, "eye": round(float(eye), 1)})
             # the classifier is the signal-list authority: detect + decode in ONE
             # pass, so tags always match their carrier (no cross-snapshot mismatch)
@@ -977,6 +991,7 @@ class H(BaseHTTPRequestHandler):
                      "delivery_pct")}, "span": SPAN_KHZ,
                     "decode": dict(DECODE), "bands": BANDS, "modes": MODES,
                     "transcript": list(TRANSCRIPT)[-14:], "scan": dict(SCANRES),
+                    "build": BUILD,
                     "smeter": round(max(0, (SPEC["peak_db"] - SPEC["noise_db"])), 1)}))
         elif u.path == "/set":
             if "band" in q and q["band"][0] in BANDS:
@@ -1366,6 +1381,10 @@ async function refresh(){
     ?`<b>👂 what you're hearing:</b> ${e.text} <span class=sub>(~${e.wpm} wpm, tone ${e.tone_hz} Hz)</span>`
     :'<span class=sub>👂 ears lane: no readable Morse in the audio right now</span>';
   $('hint').textContent=d.hint||'';
+  // stale-tab guard: an open tab keeps its old JS across panel restarts
+  if(!window._b1)window._b1=ST.build;
+  else if(ST.build&&ST.build!==window._b1)
+    $('hint').textContent='⟳ the panel was updated behind this tab — press Ctrl+Shift+R to load the new version';
   $('newcall').textContent=(d.new_calls&&d.new_calls.length)?('🎉 logged '+d.new_calls.join(' ')):'';
 }
 async function pollLog(){let s;try{s=await api('/log');}catch(e){return;}
