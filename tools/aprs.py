@@ -66,6 +66,14 @@ def _ensure_sdr_dll_path():
 
 _ensure_sdr_dll_path()
 
+# one-radio reservation (the weather_sat.py pattern): capture arbitrates
+# through radio_lock; degrade to bare-open only if the module is missing
+sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
+try:
+    import radio_lock
+except Exception:
+    radio_lock = None
+
 
 # ==========================================================================
 # shared HDLC/CRC plumbing (the AIS-proven versions)
@@ -541,37 +549,58 @@ def cmd_capture(args):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
-    sdr = SoapySDR.Device("driver=sdrplay")
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
-    sdr.setFrequency(SOAPY_SDR_RX, 0, FREQ)
+    # doctor 8/20: bare-open -> radio_lock (bounded lab capture; --secs 120+
+    # outlives the 90 s TTL, so the read loop heartbeats)
+    if radio_lock and not radio_lock.acquire(
+            "aprs_capture", f"APRS 144.390 {args.secs:.0f}s", 50, wait_s=10):
+        h = radio_lock.status() or {}
+        print(f"[capture] radio held by {h.get('owner','?')} "
+              f"({h.get('purpose','?')}) - skipping")
+        return
+    sdr = st = None
     try:
-        sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
-    except Exception:
-        pass
-    try:
-        sdr.setGainMode(SOAPY_SDR_RX, 0, False)
-        sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 22)
-        sdr.writeSetting("rfgain_sel", "0")
-    except Exception:
-        pass
-    st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
-    sdr.activateStream(st)
-    print(f"[capture] {args.secs:.0f}s @ 144.390 MHz on {args.antenna} "
-          f"(APRS beacons are bursty - longer is better)")
-    n_want = int(args.secs * FS_SDR)
-    buf = np.empty(2 * 65536, np.int16)
-    out = np.empty(2 * n_want, np.int16)
-    got = 0
-    while got < n_want:
-        r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
-        if r.ret > 0:
-            n = min(r.ret, n_want - got)
-            out[2 * got:2 * (got + n)] = buf[:2 * n]
-            got += n
-        elif r.ret < 0 and r.ret != -1:
-            break
-    sdr.deactivateStream(st)
-    sdr.closeStream(st)
+        sdr = SoapySDR.Device("driver=sdrplay")
+        sdr.setSampleRate(SOAPY_SDR_RX, 0, FS_SDR)
+        sdr.setFrequency(SOAPY_SDR_RX, 0, FREQ)
+        try:
+            sdr.setAntenna(SOAPY_SDR_RX, 0, args.antenna)
+        except Exception:
+            pass
+        try:
+            sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+            sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", 22)
+            sdr.writeSetting("rfgain_sel", "0")
+        except Exception:
+            pass
+        st = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16)
+        sdr.activateStream(st)
+        print(f"[capture] {args.secs:.0f}s @ 144.390 MHz on {args.antenna} "
+              f"(APRS beacons are bursty - longer is better)")
+        n_want = int(args.secs * FS_SDR)
+        buf = np.empty(2 * 65536, np.int16)
+        out = np.empty(2 * n_want, np.int16)
+        got = 0
+        hb = 0.0
+        while got < n_want:
+            r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
+            if r.ret > 0:
+                n = min(r.ret, n_want - got)
+                out[2 * got:2 * (got + n)] = buf[:2 * n]
+                got += n
+            elif r.ret < 0 and r.ret != -1:
+                break
+            if radio_lock and time.time() - hb > 1.5:
+                radio_lock.heartbeat()
+                hb = time.time()
+    finally:
+        try:
+            if st is not None:
+                sdr.deactivateStream(st)
+                sdr.closeStream(st)
+        except Exception:
+            pass
+        if radio_lock:
+            radio_lock.release("aprs_capture")
     iq = ((out[0::2].astype(np.float32) + 1j * out[1::2].astype(np.float32))
           / 32768.0).astype(np.complex64)[:got]
     # decimate 2.048M -> 250k (exact 125/1024); every downstream sample-rate

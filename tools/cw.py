@@ -22,6 +22,14 @@ from pathlib import Path
 
 import numpy as np
 
+# one-radio reservation (the weather_sat.py pattern): the live listen path
+# arbitrates through radio_lock; degrade to bare-open only if it's missing
+sys.path.insert(0, r"Z:\src\gr-radiotuna\tools")
+try:
+    import radio_lock
+except Exception:
+    radio_lock = None
+
 MORSE = {
     ".-": "A", "-...": "B", "-.-.": "C", "-..": "D", ".": "E", "..-.": "F",
     "--.": "G", "....": "H", "..": "I", ".---": "J", "-.-": "K", ".-..": "L",
@@ -659,6 +667,8 @@ def _open_sdr(antenna, fs=250_000.0):
     import SoapySDR
     from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16
     SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_FATAL)
+    # doctor 8/20: bare-open -> radio_lock — callers hold the lock
+    # (cmd_listen acquires before calling; external harvesters should too)
     sdr = SoapySDR.Device("driver=sdrplay")
     sdr.setSampleRate(SOAPY_SDR_RX, 0, fs)
     try:
@@ -695,6 +705,7 @@ def _grab(sdr, st, secs, fs=250_000.0, max_stall_s=None):
     out = np.empty(2 * n_want, np.int16)
     got = 0
     t_last = time.time()
+    hb = 0.0
     while got < n_want:
         r = sdr.readStream(st, [buf], 65536, timeoutUs=1_000_000)
         if r.ret > 0:
@@ -704,6 +715,9 @@ def _grab(sdr, st, secs, fs=250_000.0, max_stall_s=None):
             t_last = time.time()
         elif r.ret < 0 and r.ret != -1:
             break
+        if radio_lock and time.time() - hb > 1.5:
+            radio_lock.heartbeat()      # lock TTL 90 s < a long --secs grab
+            hb = time.time()
         if max_stall_s and time.time() - t_last > max_stall_s:
             raise RuntimeError(
                 f"SDR stream stalled: no samples for {max_stall_s:.0f}s "
@@ -720,11 +734,27 @@ def cmd_listen(args):
     import json
     import time as _t
     from SoapySDR import SOAPY_SDR_RX
-    sdr, st = _open_sdr(args.antenna, args.fs)
-    sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
-    _t.sleep(0.2)
-    iq = _grab(sdr, st, args.secs, args.fs, max_stall_s=60)
-    sdr.deactivateStream(st); sdr.closeStream(st)
+    # doctor 8/20: bare-open -> radio_lock (bounded listen, lab tier)
+    if radio_lock and not radio_lock.acquire(
+            "cw_listen", f"CW listen {args.khz:.0f} kHz", 50, wait_s=10):
+        h = radio_lock.status() or {}
+        print(f"[cw] radio held by {h.get('owner','?')} "
+              f"({h.get('purpose','?')}) - skipping listen")
+        return
+    sdr = st = None
+    try:
+        sdr, st = _open_sdr(args.antenna, args.fs)
+        sdr.setFrequency(SOAPY_SDR_RX, 0, args.khz * 1e3)
+        _t.sleep(0.2)
+        iq = _grab(sdr, st, args.secs, args.fs, max_stall_s=60)
+    finally:
+        try:
+            if st is not None:
+                sdr.deactivateStream(st); sdr.closeStream(st)
+        except Exception:
+            pass
+        if radio_lock:
+            radio_lock.release("cw_listen")
     off, pick = aim(iq, args.fs)
     if pick:
         print(f"[cw] auto-centered {off:+.0f} Hz (rhythm {pick['rhythm']}, "
