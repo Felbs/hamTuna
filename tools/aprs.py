@@ -183,26 +183,47 @@ def afsk_softbits(audio, fs=AUD):
     return soft
 
 
-def demod(iq, fs=FS):
-    from scipy.signal import resample_poly
+def demod(iq, fs=FS, phases=8):
+    """IQ -> AX.25 frames.
+
+    2026-09-27 (measured on a 90 s discone capture, 6 RF bursts): the old
+    path ran the discriminator over the whole 250 kHz span and sampled bits
+    at one fixed phase. Stock: 1 frame. With a +-6 kHz channel filter first:
+    6. Searching the bit-sampling phase as well and keeping every frame any
+    phase yields: 8 unique frames from 4 stations. Both are cheap; both stay."""
+    from scipy.signal import resample_poly, firwin, fftconvolve
     from math import gcd
     iq = iq - np.mean(iq)
+    # channel filter: a 1200 bd AFSK voice-channel signal lives within +-6 kHz;
+    # everything else in the span only feeds the discriminator noise
+    if fs > 20e3:
+        taps = firwin(129, 6000.0, fs=fs).astype(np.float32)
+        iq = fftconvolve(iq, taps, mode="same").astype(np.complex64)
     disc = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
     g = gcd(int(AUD), int(fs))
     audio = resample_poly(disc, int(AUD) // g, int(fs) // g).astype(np.float32)
     audio -= float(np.mean(audio))
-    soft = afsk_softbits(audio)
-    frames = []
-    for sgn in (1.0, -1.0):
-        line = (soft * sgn > 0).astype(np.int8)
-        bits = nrzi_decode(line)
-        for body in find_frames(bits):
-            d = parse_ax25(body)
-            if d:
-                frames.append(d)
-        if frames:
-            break
-    return frames
+    spb = AUD / BAUD
+    seen = {}
+    order = []
+    for k in range(max(1, int(phases))):
+        sh = int(round(k * spb / max(1, int(phases))))
+        soft = afsk_softbits(audio[sh:])
+        for sgn in (1.0, -1.0):
+            line = (soft * sgn > 0).astype(np.int8)
+            bits = nrzi_decode(line)
+            got = False
+            for body in find_frames(bits):
+                d = parse_ax25(body)
+                if d:
+                    got = True
+                    key = (d["src"], d["dst"], d["info"])
+                    if key not in seen:
+                        seen[key] = d
+                        order.append(key)
+            if got:
+                break
+    return [seen[k] for k in order]
 
 
 # ==========================================================================
