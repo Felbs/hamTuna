@@ -26,7 +26,8 @@ python tools/cw.py selftest      # Morse synth -> noise -> decode, no radio need
 **Dependencies:** `numpy`, `scipy`, and the `SoapySDR` python bindings +
 a driver for your SDR (live modes only — selftests run with numpy/scipy
 alone). Easiest path is [radioconda](https://github.com/ryanvolz/radioconda);
-on Debian/Ubuntu: `apt install python3-numpy python3-scipy python3-soapysdr soapysdr-module-all`.
+on Debian/Ubuntu: `apt install python3-numpy python3-scipy python3-soapysdr soapysdr-module-all`;
+on Arch/Omarchy: `pacman -S python-numpy python-scipy soapysdr soapyrtlsdr` (SDRplay: `yay -S libsdrplay soapysdrplay3-git`).
 
 ## Campaign 1 — APRS (`tools/aprs.py`)
 Amateur radio's AIS: hams beacon callsign + position over AX.25 packets,
