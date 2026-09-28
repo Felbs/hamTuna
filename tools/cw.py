@@ -455,6 +455,21 @@ def cmd_listen(args):
         lab.mkdir(exist_ok=True)
         rec = {"ts": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
                "khz": args.khz, "wpm": wpm, "text": txt}
+        # 2026-09-28: keep the IQ of every successful live copy (only then), so
+        # a half-garbled decode can be replayed and tuned offline with
+        # `cw.py decode --file ...`. CW_KEEP_IQ=0 disables. ~4 MB per second
+        # of capture at 250 kS/s; live copies are rare.
+        if os.environ.get("CW_KEEP_IQ", "1") != "0":
+            stamp = _t.strftime("%Y%m%dT%H%M%SZ", _t.gmtime())
+            iqp = lab / f"cw_{int(args.khz)}khz_{stamp}.cs16"
+            raw = np.empty(2 * len(iq), np.int16)
+            sc = 32767.0 / max(float(np.abs(iq).max()), 1e-9)
+            raw[0::2] = np.clip(iq.real * sc, -32767, 32767)
+            raw[1::2] = np.clip(iq.imag * sc, -32767, 32767)
+            raw.tofile(iqp)
+            rec["iq"] = iqp.name
+            rec["fs"] = args.fs
+            rec["offset_hz"] = off
         with open(lab / "cw_decodes.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
     else:
