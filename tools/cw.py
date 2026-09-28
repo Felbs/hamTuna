@@ -300,6 +300,34 @@ def decode_env_best(env, aud):
     return cands[0][3], cands[0][4]
 
 
+def decode_iq_best(iq, fs, off):
+    """2026-09-28: the right channel width scales with sending speed (~10 Hz
+    per wpm): a 20 wpm call copies best near 300 Hz, but tonight's real 45 wpm
+    POTA CQ on 7030 kHz read two calls at 300 Hz, three clean calls at 400 Hz,
+    and nothing at <= 250 Hz. So decode at a narrow AND a wide width and keep
+    the more plausible copy (same ranking as decode_env_best). CW_BW_HZ, if
+    set, pins a single width as before."""
+    pinned = os.environ.get("CW_BW_HZ")
+    widths = [pinned] if pinned else ["300", "450"]
+    best = None
+    old = os.environ.get("CW_BW_HZ")
+    try:
+        for w in widths:
+            os.environ["CW_BW_HZ"] = w
+            env, a = envelope(iq, fs, off)
+            tx, inf = decode_env_best(env, a)
+            n = len(tx.replace(" ", ""))
+            key = (not (3 <= inf.get("wpm", 0) <= 45 and n > 0), tx.count("?") / max(n, 1), -n)
+            if best is None or key < best[0]:
+                best = (key, tx, dict(inf, bw_hz=float(w)))
+    finally:
+        if old is None:
+            os.environ.pop("CW_BW_HZ", None)
+        else:
+            os.environ["CW_BW_HZ"] = old
+    return best[1], best[2]
+
+
 def find_offset(iq, fs, search=15000):
     N = 1 << 15
     seg = iq[:len(iq) // N * N].reshape(-1, N) * np.hanning(N).astype(np.float32)
@@ -350,8 +378,7 @@ def cmd_decode(args):
     if off is None:
         off = find_offset(iq, args.fs)
         print(f"[cw] auto-found carrier at {off:+.0f} Hz")
-    env, a = envelope(iq, args.fs, off)
-    txt, info = decode_env_best(env, a)
+    txt, info = decode_iq_best(iq, args.fs, off)
     wpm = info.get("wpm", 0)
     print(f"[cw] {info}")
     if not (3 <= wpm <= 45):
@@ -445,8 +472,7 @@ def cmd_listen(args):
     iq = _grab(sdr, st, args.secs, args.fs)
     sdr.deactivateStream(st); sdr.closeStream(st)
     off = find_offset(iq, args.fs)
-    env, a = envelope(iq, args.fs, off)
-    txt, info = decode_env_best(env, a)
+    txt, info = decode_iq_best(iq, args.fs, off)
     wpm = info.get("wpm", 0)
     if 3 <= wpm <= 45 and txt.strip():
         print(f"[cw] {args.khz} kHz  {info}")
