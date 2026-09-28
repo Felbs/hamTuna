@@ -79,10 +79,34 @@ def _runs_to_text(runs, aud):
     on_runs = [ln for s, ln in runs if s]
     if len(on_runs) < 3:
         return "", {"runs": len(runs)}
-    # dit length = the shorter cluster of ON runs (k-means-lite, 2 groups)
+    # dit length = the shorter cluster of ON runs.
+    # 2026-09-28: this used to be median(o[o <= median(o)]), which is only a
+    # dit when dits OUTNUMBER dahs. "NDB" (6 dits, 3 dahs) passed the selftest;
+    # "CQ CQ DE N0CALL K" (24 dahs, 20 dits) got a dah-sized "dit", so every
+    # element read as a dot and a CLEAN, noise-free signal decoded '??H?S'.
+    # Now: 2-means on the ON runs (dah/dit = 3 by the standard); if the two
+    # clusters are not separated (a stream of only dits or only dahs), take
+    # the shortest GAP cluster instead -- intra-character gaps are one dit.
     o = np.array(on_runs, float)
-    med = np.median(o)
-    dit = np.median(o[o <= med]) or med
+    lo_c, hi_c = float(o.min()), float(o.max())
+    for _ in range(30):
+        lab = np.abs(o - lo_c) > np.abs(o - hi_c)
+        n_lo = o[~lab].mean() if np.any(~lab) else lo_c
+        n_hi = o[lab].mean() if np.any(lab) else hi_c
+        if abs(n_lo - lo_c) < 1e-9 and abs(n_hi - hi_c) < 1e-9:
+            break
+        lo_c, hi_c = n_lo, n_hi
+    if hi_c >= 2.0 * lo_c:
+        dit = float(np.median(o[~lab]))
+    else:
+        g = np.array([ln for i, (s, ln) in enumerate(runs)
+                      if not s and 0 < i < len(runs) - 1], float)
+        g = g[g < 2.0 * np.median(o)] if len(g) else g
+        dit = float(np.median(g)) if len(g) >= 3 else float(np.median(o))
+        if dit > 0 and np.median(o) > 2.0 * dit:
+            pass                                  # all dahs: ON median is ~3 dits
+        else:
+            dit = min(dit, float(np.median(o))) if dit > 0 else float(np.median(o))
     # gap boundaries adapt to the stream's own spacing (Farnsworth-safe)
     off_runs = [ln for i, (s, ln) in enumerate(runs) if not s and 0 < i < len(runs) - 1]
     lb, wb = _gap_boundaries(off_runs, dit)
