@@ -19,6 +19,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import os
 import numpy as np
 
 MORSE = {
@@ -39,6 +40,17 @@ def envelope(iq, fs, off_hz, aud=8000):
     x = iq * np.exp(-2j * np.pi * off_hz / fs * n)
     g = gcd(int(aud), int(fs))
     x = resample_poly(x, int(aud) // g, int(fs) // g).astype(np.complex64)
+    # 2026-09-28: CHANNEL FILTER before the magnitude. The decimator leaves
+    # +-4 kHz of noise around a tone that needs +-150 Hz (a 40 wpm dit is
+    # 30 ms), so the envelope sat on ~8 kHz of noise: on/off contrast was
+    # 0.82 vs 0.56 at 20 dB SNR (500 Hz ref) and copy died by 12 dB.
+    # find_offset() resolves the tone to fs/32768 (~8 Hz at 250 kS/s), so a
+    # 300 Hz complex low-pass is safe. CW_BW_HZ overrides (0 = old path).
+    bw = float(os.environ.get("CW_BW_HZ", "300"))
+    if bw > 0:
+        from scipy.signal import firwin
+        taps = firwin(255, bw / 2.0, fs=aud).astype(np.float32)
+        x = np.convolve(x, taps, mode="same").astype(np.complex64)
     env = np.abs(x).astype(np.float32)
     k = max(1, int(aud * 0.008))          # 8 ms smoother
     return np.convolve(env, np.ones(k, np.float32) / k, mode="same"), aud
