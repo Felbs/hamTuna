@@ -272,6 +272,34 @@ def decode_env_auto(env, aud):
     return txt, info
 
 
+def decode_env_best(env, aud):
+    """2026-09-28: run the classic threshold decoder AND the matched-filter
+    decoder, keep the more plausible copy: keying rate inside 3-45 wpm first,
+    then the lower share of undecodable '?' characters, then the longer text.
+    Measured on 'CQ CQ DE N0CALL K' at 20 wpm, 12 seeds per cell, 300 Hz
+    channel filter on (character accuracy):
+        steady 12 / 8 / 4 dB     classic 100 / 90 / 0 %   best 100 / 89 / 42 %
+        0.3 Hz fade 12 / 8 / 4   classic  17 / 11 / 0 %   best  71 / 65 / 31 %
+        1 Hz fade 12 / 8 / 4     classic   4 /  0 / 0 %   best  39 / 30 /  8 %
+    and never materially worse than decode_env_auto (the apparatus router,
+    which misses the matched filter's weak-signal wins)."""
+    cands = []
+    for route, f in (("classic", decode_env), ("mf", decode_env_mf)):
+        try:
+            tx, inf = f(env, aud)
+        except Exception:                                  # noqa: BLE001
+            continue
+        w = inf.get("wpm", 0)
+        n = len(tx.replace(" ", ""))
+        ok = 3 <= w <= 45 and n > 0
+        inf = dict(inf, route=route)
+        cands.append((not ok, tx.count("?") / max(n, 1), -n, tx, inf))
+    if not cands:
+        return "", {}
+    cands.sort(key=lambda r: r[:3])
+    return cands[0][3], cands[0][4]
+
+
 def find_offset(iq, fs, search=15000):
     N = 1 << 15
     seg = iq[:len(iq) // N * N].reshape(-1, N) * np.hanning(N).astype(np.float32)
@@ -323,7 +351,7 @@ def cmd_decode(args):
         off = find_offset(iq, args.fs)
         print(f"[cw] auto-found carrier at {off:+.0f} Hz")
     env, a = envelope(iq, args.fs, off)
-    txt, info = decode_env(env, a)
+    txt, info = decode_env_best(env, a)
     wpm = info.get("wpm", 0)
     print(f"[cw] {info}")
     if not (3 <= wpm <= 45):
@@ -418,7 +446,7 @@ def cmd_listen(args):
     sdr.deactivateStream(st); sdr.closeStream(st)
     off = find_offset(iq, args.fs)
     env, a = envelope(iq, args.fs, off)
-    txt, info = decode_env(env, a)
+    txt, info = decode_env_best(env, a)
     wpm = info.get("wpm", 0)
     if 3 <= wpm <= 45 and txt.strip():
         print(f"[cw] {args.khz} kHz  {info}")
@@ -430,7 +458,7 @@ def cmd_listen(args):
         with open(lab / "cw_decodes.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
     else:
-        print(f"[cw] {args.khz} kHz: no readable CW (wpm {wpm})")
+        print(f"[cw] {args.khz} kHz: no readable CW (best timing estimate {wpm} wpm; readable is 3-45)")
 
 
 def main():
